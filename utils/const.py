@@ -1,1 +1,1 @@
-regression_loss = ['mean_square_error', 'mean_absolute_error', 'smooth_L1']
+regression_loss = ["mean_square_error", "mean_absolute_error", "smooth_L1"]

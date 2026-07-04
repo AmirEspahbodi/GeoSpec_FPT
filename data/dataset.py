@@ -1,18 +1,21 @@
 import os
-from PIL import Image
 from pathlib import Path
-from torchvision import datasets
+
+from PIL import Image
 from safetensors.torch import load_file
+from torchvision import datasets
 
 
 def pil_loader(path):
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         img = Image.open(f)
-        return img.convert('RGB')
+        return img.convert("RGB")
 
 
 class AsymetricImageFolder(datasets.ImageFolder):
-    def __init__(self, root, lpm_transform=None, side_transform=None, loader=pil_loader):
+    def __init__(
+        self, root, lpm_transform=None, side_transform=None, loader=pil_loader
+    ):
         super(AsymetricImageFolder, self).__init__(root, loader=loader)
         self.lpm_transform = lpm_transform
         self.side_transform = side_transform
@@ -40,9 +43,9 @@ class PreloadImageFolder(datasets.ImageFolder):
         return side_sample, key_states, value_states, target
 
     def preload(self, path):
-        states_path = os.path.join(self.preload_path, Path(path).stem + '.safetensors')
+        states_path = os.path.join(self.preload_path, Path(path).stem + ".safetensors")
         states = load_file(states_path)
-        key_states, value_states = states['key_states'], states['value_states']
+        key_states, value_states = states["key_states"], states["value_states"]
         return key_states, value_states
 
 

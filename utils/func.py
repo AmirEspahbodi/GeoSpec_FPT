@@ -1,31 +1,27 @@
-import os
-import sys
-
-import yaml
-import torch
-import shutil
 import argparse
-import torch.nn as nn
-
-from tqdm import tqdm
-from operator import getitem
+import os
+import shutil
+import sys
 from functools import reduce
+from operator import getitem
+
+import torch
+import torch.nn as nn
+import yaml
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from utils.const import regression_loss
 
 
 def mean_and_std(train_dataset, batch_size, num_workers):
     loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=False
+        train_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False
     )
 
-    num_samples = 0.
-    channel_mean = torch.Tensor([0., 0., 0.])
-    channel_std = torch.Tensor([0., 0., 0.])
+    num_samples = 0.0
+    channel_mean = torch.Tensor([0.0, 0.0, 0.0])
+    channel_std = torch.Tensor([0.0, 0.0, 0.0])
     for samples in tqdm(loader):
         X, _ = samples
         channel_mean += X.mean((2, 3)).sum(0)
@@ -40,13 +36,15 @@ def mean_and_std(train_dataset, batch_size, num_workers):
     channel_std = torch.sqrt(channel_std / num_samples)
 
     mean, std = channel_mean.tolist(), channel_std.tolist()
-    print('mean: {}'.format(mean))
-    print('std: {}'.format(std))
+    print("mean: {}".format(mean))
+    print("std: {}".format(std))
     return mean, std
 
 
 def save_weights(model, save_path):
-    if isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel):
+    if isinstance(model, nn.DataParallel) or isinstance(
+        model, nn.parallel.DistributedDataParallel
+    ):
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
@@ -54,28 +52,28 @@ def save_weights(model, save_path):
 
 
 def print_msg(msg, appendixs=[], warning=False):
-    color = '\033[93m'
-    end = '\033[0m'
+    color = "\033[93m"
+    end = "\033[0m"
     print_fn = (lambda x: print(color + x + end)) if warning else print
 
     max_len = len(max([msg, *appendixs], key=len))
     max_len = min(max_len, get_terminal_col())
-    print_fn('=' * max_len)
+    print_fn("=" * max_len)
     print_fn(msg)
     for appendix in appendixs:
         print_fn(appendix)
-    print_fn('=' * max_len)
+    print_fn("=" * max_len)
 
 
 def print_dataset_info(datasets):
     train_dataset, test_dataset, val_dataset = datasets
-    print('=========================')
-    print('Dataset Loaded.')
-    print('Categories:\t{}'.format(len(train_dataset.classes)))
-    print('Training:\t{}'.format(len(train_dataset)))
-    print('Validation:\t{}'.format(len(val_dataset)))
-    print('Test:\t\t{}'.format(len(test_dataset)))
-    print('=========================')
+    print("=========================")
+    print("Dataset Loaded.")
+    print("Categories:\t{}".format(len(train_dataset.classes)))
+    print("Training:\t{}".format(len(train_dataset)))
+    print("Validation:\t{}".format(len(val_dataset)))
+    print("Test:\t\t{}".format(len(test_dataset)))
+    print("=========================")
 
 
 # unnormalize image for visualization
@@ -93,14 +91,14 @@ def one_hot(labels, num_classes, device, dtype):
 
 # convert type of target according to criterion
 def select_target_type(y, criterion):
-    if criterion in ['cross_entropy', 'kappa_loss']:
+    if criterion in ["cross_entropy", "kappa_loss"]:
         y = y.long()
-    elif criterion in ['mean_square_error', 'mean_absolute_error', 'smooth_L1']:
+    elif criterion in ["mean_square_error", "mean_absolute_error", "smooth_L1"]:
         y = y.float()
-    elif criterion in ['focal_loss']:
+    elif criterion in ["focal_loss"]:
         y = y.to(dtype=torch.int64)
     else:
-        raise NotImplementedError('Not implemented criterion.')
+        raise NotImplementedError("Not implemented criterion.")
     return y
 
 
@@ -143,5 +141,5 @@ def add_path_suffix(path):
     new_path = path
     while os.path.exists(new_path):
         suffix += 1
-        new_path = path + '_{}'.format(suffix)
+        new_path = path + "_{}".format(suffix)
     return new_path

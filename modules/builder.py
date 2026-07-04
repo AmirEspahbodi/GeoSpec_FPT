@@ -1,11 +1,11 @@
 import torch
-
 from transformers import ViTConfig
+
 from utils.func import print_msg, select_out_features
 
 from .bridge import FineGrainedPromptTuning, FusionModule
-from .side_vit import ViTForImageClassification as SideViT
 from .frozen_vit import ViTForImageClassification as FrozenViT
+from .side_vit import ViTForImageClassification as SideViT
 
 
 def generate_model(cfg):
@@ -30,24 +30,25 @@ def generate_model(cfg):
                 if param.requires_grad:
                     num_learnable_params += param.numel()
 
-        print('Total params: {}'.format(total_params))
-        print('Learnable params: {}'.format(num_learnable_params))
-        print('Learnable params ratio: {:.4f}%'.format(num_learnable_params / total_params * 100))
+        print("Total params: {}".format(total_params))
+        print("Learnable params: {}".format(num_learnable_params))
+        print(
+            "Learnable params ratio: {:.4f}%".format(
+                num_learnable_params / total_params * 100
+            )
+        )
 
     return frozen_encoder, model
 
 
 def load_weights(model, checkpoint):
-    weights = torch.load(checkpoint, map_location='cpu')
+    weights = torch.load(checkpoint, map_location="cpu")
     model.load_state_dict(weights, strict=True)
-    print_msg('Load weights form {}'.format(checkpoint))    
+    print_msg("Load weights form {}".format(checkpoint))
 
 
 def build_model(cfg):
-    out_features = select_out_features(
-        cfg.dataset.num_classes,
-        cfg.train.criterion
-    )
+    out_features = select_out_features(cfg.dataset.num_classes, cfg.train.criterion)
     num_layers = len(parse_layers(cfg.network.layers_to_extract))
     vit_config = ViTConfig.from_pretrained(cfg.network.pretrained_path)
     side_dimension = vit_config.hidden_size // cfg.network.side_reduction_ratio
@@ -60,7 +61,7 @@ def build_model(cfg):
         num_prompts=cfg.network.num_prompts,
         prompt_dim=prompts_dim,
         prompt_norm=cfg.network.prompt_norm,
-        prompt_proj=cfg.network.prompt_proj
+        prompt_proj=cfg.network.prompt_proj,
     )
 
     side_config = ViTConfig.from_pretrained(
@@ -71,7 +72,7 @@ def build_model(cfg):
         image_size=cfg.network.side_input_size,
         num_labels=out_features,
         hidden_dropout_prob=0,
-        attention_probs_dropout_prob=0
+        attention_probs_dropout_prob=0,
     )
     side_encoder = SideViT(side_config)
 
@@ -86,8 +87,7 @@ def build_frozen_encoder(cfg):
     frozen_config.layers_to_extract = parse_layers(cfg.network.layers_to_extract)
 
     frozen_encoder = FrozenViT.from_pretrained(
-        cfg.network.pretrained_path,
-        config=frozen_config
+        cfg.network.pretrained_path, config=frozen_config
     )
 
     frozen_encoder.eval()
@@ -98,10 +98,10 @@ def build_frozen_encoder(cfg):
 
 
 def parse_layers(layers_to_extract):
-    if '-' in layers_to_extract:
-        start, end = layers_to_extract.split('-')
+    if "-" in layers_to_extract:
+        start, end = layers_to_extract.split("-")
         return list(range(int(start), int(end) + 1))
-    elif ',' in layers_to_extract:
-        return list(map(int, layers_to_extract.split(',')))
-    else:                   
+    elif "," in layers_to_extract:
+        return list(map(int, layers_to_extract.split(",")))
+    else:
         return [int(layers_to_extract)]
