@@ -8,12 +8,12 @@ import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from model.rff_axial import QueryEnhancedSideViTClassifier_rff_axial
 from omegaconf import ListConfig, OmegaConf
 
 from data.builder import generate_dataset, generate_model, load_weights
 from evaluate_model import evaluate_model
-from model.rff_axial import QueryEnhancedSideViTClassifier_rff_axial
-from model.rff_query import QueryEnhancedSideViTClassifier_rff_query
+from model.GeoSpec_FPT import GeoSpecClassifier
 from parameters_count import model_params_summary
 from train import train as train_a
 from utils.func import DataLoader, add_path_suffix, print_msg
@@ -122,48 +122,16 @@ def main(cfg):
     del frozen_encoder2
 
     print(f"type cfg = {type(cfg)}")
-    match cfg.network.model:
-        case "model4_org":
-            classifier_with_side_vits = QueryEnhancedSideViTClassifier(
-                side_vit1=side_vit_model1,
-                side_vit2=side_vit_model2,
-                cfg=cfg,
-            ).to(cfg.base.device)
-        case "model4_axial":
-            classifier_with_side_vits = QueryEnhancedSideViTClassifier_Axial(
-                side_vit1=side_vit_model1,
-                side_vit2=side_vit_model2,
-                cfg=cfg,
-            ).to(cfg.base.device)
-        case "model4_linear_rff":
-            classifier_with_side_vits = QueryEnhancedSideViTClassifier_LinearRFF(
-                side_vit1=side_vit_model1,
-                side_vit2=side_vit_model2,
-                cfg=cfg,
-            ).to(cfg.base.device)
-        case "model4_query":
-            classifier_with_side_vits = QueryEnhancedSideViTClassifier_Query(
-                side_vit1=side_vit_model1,
-                side_vit2=side_vit_model2,
-                cfg=cfg,
-            ).to(cfg.base.device)
-            raise RuntimeError()
+    classifier_with_side_vits = GeoSpecClassifier(
+        side_vit_b1=side_vit_model1,
+        side_vit_b2=side_vit_model2,
+        cfg=cfg,
+    ).to(cfg.base.device)
 
     estimator = Estimator(
         cfg.train.metrics, cfg.dataset.num_classes, cfg.train.criterion
     )
-    train_pipeline = None
-    training_plan = cfg.base.training_plan.strip()
-    if training_plan == "A":
-        train_pipeline = train_a
-    elif training_plan == "B":
-        train_pipeline = train_b
-    elif training_plan == "C":
-        train_pipeline = train_c
-    elif training_plan == "D":
-        train_pipeline = train_d
-    else:
-        raise RuntimeError()
+    train_pipeline = train_a
     model_summary_json = model_params_summary(classifier_with_side_vits)
     finall_resul_path = os.path.join(cfg.dataset.save_path, "model_summary_json.json")
 
