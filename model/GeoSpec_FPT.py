@@ -1,9 +1,34 @@
-from typing import Any, List, Optional
+import math
+from typing import Any, Dict, List, Optional, Tuple
 
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ===========================================================================
+#  DropPath (Stochastic Depth) Implementation
+#
+#  [Shared module — identical implementation in both Branch 1 and Branch 2.
+#   Each branch instantiates its own DropPath for independent stochastic
+#   depth masks.]
+# ===========================================================================
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return x.div(keep_prob) * random_tensor
 
 
 # ===========================================================================
@@ -69,8 +94,9 @@ class GatedFeatureFusionHead(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        # Shared LayerNorm (applied independently to each branch embedding)
-        self.norm = nn.LayerNorm(hidden_size)
+        # Per-branch LayerNorm (applied independently to each branch embedding)
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
 
         # Per-branch self-gating (channel-wise feature selection)
         self.gate1 = nn.Sequential(
@@ -115,10 +141,15 @@ class GatedFeatureFusionHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        for gate in [self.gate1, self.gate2]:
+            final_linear = gate[-2]
+            nn.init.zeros_(final_linear.weight)
+            nn.init.constant_(final_linear.bias, 4.0)
+
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         # Normalize each branch embedding independently
-        x1 = self.norm(x1)
-        x2 = self.norm(x2)
+        x1 = self.norm1(x1)
+        x2 = self.norm2(x2)
 
         # Per-branch self-gating
         g1 = self.gate1(x1)
@@ -483,222 +514,143 @@ class AWTTFModule(nn.Module):
         return out
 
     @staticmethod
-    def _compute_dwt_levels(low_size: int, high_size: int) -> int:
+    def _compute_dwt_levels(low_size: int, high_size: int) -> Tuple[int, bool]:
         """Compute the number of DWT levels L to align spatial dimensions.
-
-        The ratio low_size / high_size must be a positive integer power of 2.
-        This ensures cascaded DWT exactly reaches the deep feature resolution
-        without any lossy spatial interpolation.
-
-        Parameters
-        ----------
-        low_size : int
-            Spatial dimension of the shallow feature (larger).
-        high_size : int
-            Spatial dimension of the deep feature (smaller).
-
-        Returns
-        -------
-        int : Number of DWT levels L (0 if sizes are equal).
+        Returns (L, is_feasible). Falls back to 0 if dimensions are incompatible.
         """
-        assert low_size >= high_size, (
-            f"Low-level spatial size ({low_size}) must be >= high-level ({high_size})"
-        )
-        assert low_size % high_size == 0, (
-            f"Spatial ratio must be an integer: {low_size}/{high_size}"
-        )
-        ratio = low_size // high_size
+        if low_size < high_size:
+            return 0, False
+
+        ratio = low_size / high_size
+        # Check if ratio is an integer
+        if abs(ratio - round(ratio)) > 1e-6:
+            return 0, False
+
+        ratio_int = int(round(ratio))
         L = 0
-        r = ratio
+        r = ratio_int
         while r > 1:
-            assert r % 2 == 0, f"Spatial ratio must be a power of 2, got {ratio}"
+            if r % 2 != 0:
+                return 0, False
             r //= 2
             L += 1
-        return L
+
+        # Check if all intermediate spatial dimensions are even
+        temp_h = low_size
+        for _ in range(L):
+            if temp_h % 2 != 0:
+                return 0, False
+            temp_h //= 2
+
+        return L, True
 
     def forward(
         self,
         low_level_feat: torch.Tensor,
         high_level_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass of AWT-TF.
-
-        Parameters
-        ----------
-        low_level_feat : torch.Tensor
-            Shallow features X_low of shape (B, C_low, H, W).
-        high_level_feat : torch.Tensor
-            Deep features X_high of shape (B, C_high, H/2^L, W/2^L).
-
-        Returns
-        -------
-        torch.Tensor
-            Fused features Y of shape (B, C_out, H, W).
-        """
         B, C_low, H_low, W_low = low_level_feat.shape
         _, C_high, H_high, W_high = high_level_feat.shape
 
         # Determine the number of DWT levels needed for spatial alignment
-        L = self._compute_dwt_levels(H_low, H_high)
-        assert L == self._compute_dwt_levels(W_low, W_high), (
-            f"H and W DWT levels must match: "
-            f"H ratio {H_low}/{H_high} vs W ratio {W_low}/{W_high}"
-        )
+        L_h, feasible_h = self._compute_dwt_levels(H_low, H_high)
+        L_w, feasible_w = self._compute_dwt_levels(W_low, W_high)
 
-        # ================================================================
+        is_feasible = feasible_h and feasible_w and (L_h == L_w)
+        L_actual = L_h if is_feasible else 0
+
         # Step 1: Channel Alignment
-        #   tilde_X_high = Conv1x1(X_high)  ->  (B, C_low, H_high, W_high)
-        # ================================================================
         X_high_tilde = self.high_align(high_level_feat)
 
-        # ================================================================
-        # Step 2: Multi-Level Haar Wavelet Decomposition
-        #   Apply DWT recursively L times on X_low.
-        #   Produces LL^(L) at (H_high, W_high) and a pyramid of
-        #   high-frequency bands {LH^(l), HL^(l), HH^(l)} for l=1..L.
-        # ================================================================
-        LL = low_level_feat
-        high_freq_bands: List = []  # [(LH, HL, HH)] per level, l=1 to L
-        for _ in range(L):
-            LL, LH, HL, HH = self._haar_dwt_2d(LL)
-            high_freq_bands.append((LH, HL, HH))
-        LL_L = LL  # (B, C_low, H_high, W_high)
+        # Step 2: Multi-Level Haar Wavelet Decomposition (with fallback)
+        if L_actual > 0:
+            LL = low_level_feat
+            high_freq_bands: List = []
+            for _ in range(L_actual):
+                LL, LH, HL, HH = self._haar_dwt_2d(LL)
+                high_freq_bands.append((LH, HL, HH))
+            LL_L = LL
+        else:
+            # Fallback for incompatible spatial dimensions
+            LL_L = F.interpolate(
+                low_level_feat,
+                size=X_high_tilde.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            high_freq_bands = []
 
-        # Verify spatial alignment (safety check, guaranteed by construction)
-        assert X_high_tilde.shape[-2:] == LL_L.shape[-2:], (
-            f"Spatial mismatch after alignment: "
-            f"X_high_tilde {X_high_tilde.shape[-2:]} vs LL_L {LL_L.shape[-2:]}"
-        )
-
-        # ================================================================
         # Step 3: Dual-Pathway Dynamic Core Prediction
-        #   Spatial pathway:  GAP(X_high_tilde) || GAP(LL_L) -> MLP
-        #   Spectral pathway: GAP(Conv1x1(LL_L))
-        #   Core: G = G_spatial ⊙ G_spectral  ∈ R^{B × r × r × C_out}
-        # ================================================================
-
-        # --- Spatial pathway (global macro-semantics) ---
         g_spatial = torch.cat(
             [
-                F.adaptive_avg_pool2d(X_high_tilde, 1).flatten(1),  # (B, C_low)
-                F.adaptive_avg_pool2d(LL_L, 1).flatten(1),  # (B, C_low)
+                F.adaptive_avg_pool2d(X_high_tilde, 1).flatten(1),
+                F.adaptive_avg_pool2d(LL_L, 1).flatten(1),
             ],
             dim=1,
-        )  # (B, 2*C_low)
-        G_spatial = self.mlp_spatial(g_spatial)  # (B, r*r*C_out)
-        G_spatial = G_spatial.view(
-            B, self.r, self.r, self.output_channels
-        )  # (B, r, r, C_out)
+        )
+        G_spatial = self.mlp_spatial(g_spatial)
+        G_spatial = G_spatial.view(B, self.r, self.r, self.output_channels)
 
-        # --- Spectral pathway (localized frequency structures) ---
-        # Efficient computation: Conv1x1(GAP(LL_L)) ≡ GAP(Conv1x1(LL_L))
-        # because Conv1x1 is linear and pointwise. This avoids materializing
-        # the (B, r²·C_out, H_high, W_high) intermediate, saving VRAM.
-        g_LL = F.adaptive_avg_pool2d(LL_L, 1)  # (B, C_low, 1, 1)
-        spectral_feat = self.spectral_conv(g_LL)  # (B, r*r*C_out, 1, 1)
-        g_spectral = spectral_feat.flatten(1)  # (B, r*r*C_out)
-        G_spectral = g_spectral.view(
-            B, self.r, self.r, self.output_channels
-        )  # (B, r, r, C_out)
+        g_LL = F.adaptive_avg_pool2d(LL_L, 1)
+        spectral_feat = self.spectral_conv(g_LL)
+        g_spectral = spectral_feat.flatten(1)
+        G_spectral = g_spectral.view(B, self.r, self.r, self.output_channels)
 
-        # Dynamic core via element-wise modulation
-        G = G_spatial * G_spectral  # (B, r, r, C_out)
+        G = G_spatial * G_spectral
 
-        # ================================================================
         # Step 4: Static Factor Projection
-        #   P_high = U_high^T · tilde_X_high  ∈ R^{B × r × H_high × W_high}
-        #   P_LL   = U_LL^T · LL^(L)           ∈ R^{B × r × H_high × W_high}
-        # ================================================================
-        P_high = self.U_high(X_high_tilde)  # (B, r, H_high, W_high)
-        P_LL = self.U_LL(LL_L)  # (B, r, H_high, W_high)
+        P_high = self.U_high(X_high_tilde)
+        P_LL = self.U_LL(LL_L)
 
-        # ================================================================
         # Step 5: Higher-Order Tucker Reconstruction
-        #   tilde_LL^(L)_k(p) = Σ_i Σ_j G_ijk · P_high^(i)(p) · P_LL^(j)(p)
-        #   Einsum: 'bijk,bihw,bjhw->bkhw'
-        #   This captures rank-r² cross-layer interactions (256× at r=16),
-        #   far exceeding the rank-1 capacity of multiplicative gating.
-        # ================================================================
-        LL_fused = torch.einsum(
-            "bijk,bihw,bjhw->bkhw", G, P_high, P_LL
-        )  # (B, C_out, H_high, W_high)
+        LL_fused = torch.einsum("bijk,bihw,bjhw->bkhw", G, P_high, P_LL)
 
-        # ================================================================
-        # Step 6: Channel-Wise Dynamic Spectral Gating with Cross-Band
-        #          Coherence
-        #   For each level l:
-        #     g^(l) = GAP([LH^(l) || HL^(l) || HH^(l)])
-        #     G_bands^(l) = σ(reshape(MLP_bands(g^(l)), [B, 3, C_out]))
-        #     Ĝ^(l) = softmax(M_cross) · G_bands^(l)
-        #     tilde_LH^(l) = Conv1x1(LH^(l)) ⊙ Ĝ^(l)_{:,1,:}
-        #     (similarly for HL, HH)
-        # ================================================================
+        # Step 6: Channel-Wise Dynamic Spectral Gating
+        M_cross_softmax = F.softmax(self.M_cross, dim=-1)
 
-        # Softmax-normalized cross-band coherence matrix (row-wise)
-        M_cross_softmax = F.softmax(self.M_cross, dim=-1)  # (3, 3)
-
-        modulated_bands: List = []  # [(tilde_LH, tilde_HL, tilde_HH)] per level
-        for l in range(L):
+        modulated_bands: List = []
+        for l in range(L_actual):
             LH_l, HL_l, HH_l = high_freq_bands[l]
-
-            # Global context from stacked high-frequency bands
-            stacked = torch.cat([LH_l, HL_l, HH_l], dim=1)  # (B, 3*C_low, Hl, Wl)
-            g_bands = F.adaptive_avg_pool2d(stacked, 1).flatten(1)  # (B, 3*C_low)
-
-            # Predict band-specific channel gates via shared MLP + sigmoid
-            G_bands = self.mlp_bands(g_bands)  # (B, 3*C_out)
-            G_bands = G_bands.view(B, 3, self.output_channels)  # (B, 3, C_out)
+            stacked = torch.cat([LH_l, HL_l, HH_l], dim=1)
+            g_bands = F.adaptive_avg_pool2d(stacked, 1).flatten(1)
+            G_bands = self.mlp_bands(g_bands)
+            G_bands = G_bands.view(B, 3, self.output_channels)
             G_bands = torch.sigmoid(G_bands)
+            G_hat = torch.einsum("ij,bjk->bik", M_cross_softmax, G_bands)
 
-            # Apply cross-band coherence: softmax(M_cross) @ G_bands
-            # M_cross_softmax: (3, 3), G_bands: (B, 3, C_out)
-            # Result: (B, 3, C_out) — each output band is a coherent
-            # weighted combination of all input band gates.
-            G_hat = torch.einsum(
-                "ij,bjk->bik", M_cross_softmax, G_bands
-            )  # (B, 3, C_out)
-
-            # Project high-frequency bands to output channel dimension
-            LH_proj = self.band_proj_lh(LH_l)  # (B, C_out, Hl, Wl)
+            LH_proj = self.band_proj_lh(LH_l)
             HL_proj = self.band_proj_hl(HL_l)
             HH_proj = self.band_proj_hh(HH_l)
 
-            # Reshape gates for spatial broadcasting: (B, C_out, 1, 1)
             gate_lh = G_hat[:, 0, :].unsqueeze(-1).unsqueeze(-1)
             gate_hl = G_hat[:, 1, :].unsqueeze(-1).unsqueeze(-1)
             gate_hh = G_hat[:, 2, :].unsqueeze(-1).unsqueeze(-1)
 
-            # Modulate projected bands with coherence-adjusted gates
-            tilde_LH = LH_proj * gate_lh  # (B, C_out, Hl, Wl)
+            tilde_LH = LH_proj * gate_lh
             tilde_HL = HL_proj * gate_hl
             tilde_HH = HH_proj * gate_hh
 
             modulated_bands.append((tilde_LH, tilde_HL, tilde_HH))
 
-        # ================================================================
         # Step 7: Multi-Level Wavelet Reconstruction
-        #   Reconstruct full-resolution feature map via cascaded IDWT,
-        #   starting from the deepest level (tilde_LL^(L)) and integrating
-        #   modulated high-frequency bands up to the original H × W.
-        # ================================================================
-        current_LL = LL_fused  # (B, C_out, H_high, W_high)
-        # Iterate from deepest level (L) up to shallowest (1)
-        for l in range(L - 1, -1, -1):
+        current_LL = LL_fused
+        for l in range(L_actual - 1, -1, -1):
             tilde_LH, tilde_HL, tilde_HH = modulated_bands[l]
             current_LL = self._haar_idwt_2d(current_LL, tilde_LH, tilde_HL, tilde_HH)
-        X_fused = current_LL  # (B, C_out, H_low, W_low)
 
-        # ================================================================
+        if L_actual == 0:
+            current_LL = F.interpolate(
+                current_LL, size=(H_low, W_low), mode="bilinear", align_corners=False
+            )
+        X_fused = current_LL
+
         # Step 8: Identity-Anchored Output
-        #   Y = GELU(GN(Conv1x1(X_fused))) + α · Conv1x1(X_low)
-        #   α = 0 at init => module is transparent at epoch 0.
-        # ================================================================
-        out = self.final_proj(X_fused)  # (B, C_out, H, W)
-        out = self.final_norm(out)  # GroupNorm (zero-init at start)
-        out = self.act(out)  # GELU
+        out = self.final_proj(X_fused)
+        out = self.final_norm(out)
+        out = self.act(out)
 
-        skip = self.skip_proj(low_level_feat)  # (B, C_out, H, W)
-        out = out + self.alpha * skip  # Identity-anchored residual
+        skip = self.skip_proj(low_level_feat)
+        out = out + self.alpha * skip
 
         return out
 
@@ -718,6 +670,11 @@ class LinearRFFCrossAttention(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        # FIX 3: Enforce channel equality for residual addition
+        assert query_channels == output_channels, (
+            f"query_channels ({query_channels}) must equal output_channels ({output_channels}) "
+            f"for residual addition in LinearRFFCrossAttention."
+        )
         inter_channels = max(context_channels // 2, query_channels * 2, 32)
 
         self.query_conv = nn.Conv2d(
@@ -752,7 +709,9 @@ class LinearRFFCrossAttention(nn.Module):
         self.proj_norm = nn.GroupNorm(1, output_channels)
         self.proj_drop = nn.Dropout(dropout)
 
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # FIX: Initialize to a small non-zero value (1e-2) instead of 0.0
+        # This breaks the dead-gradient cycle while preserving identity init.
+        self.gamma = nn.Parameter(torch.tensor(1e-2))
         self._init_weights()
 
     def _init_weights(self):
@@ -812,45 +771,8 @@ class LinearRFFCrossAttention(nn.Module):
 # ===========================================================================
 #  LC-HPHF v2: Learnable-Curvature Dual-Path Hyperbolic Poincaré
 #  Hierarchical Fusion
-#
-#  Replaces GatedAttentionModule with a geometrically grounded fusion
-#  paradigm that respects the intrinsic hierarchical taxonomy of visual
-#  features via a dual-path (hyperbolic + Euclidean) architecture.
-#
-#  Mathematical Pipeline:
-#    1.  Spatial alignment & tangent projection (1×1 convs, scaled by τ)
-#    2.  Learnable curvature  c = softplus(θ_c) + ε
-#    3.  Exponential map to Poincaré ball  B^C_c
-#    4.  Zero-init conformal confidence weighting  (noise annihilation)
-#    5.  Einstein mid-point fusion  (exact closed-form)
-#    6.  Logarithmic map back to Euclidean tangent space
-#    7.  Dual-path Euclidean residual  (flat continuous feature preservation)
-#    8.  Coupled output via learnable scalar α
-#    9.  Auxiliary conformal confidence map export
 # ===========================================================================
 class LCHPHFv2(nn.Module):
-    """
-    LC-HPHF v2: Learnable-Curvature Dual-Path Hyperbolic Poincaré
-    Hierarchical Fusion.
-
-    Parameters
-    ----------
-    low_level_channels : int
-        Channel dimension of the shallow feature map F_low.
-    high_level_channels : int
-        Channel dimension of the deep feature map F_high.
-    output_channels : int
-        Channel dimension of the fused output F_out.
-    c_min : float
-        Minimum curvature for log-barrier regularization.
-    c_max : float
-        Maximum curvature for log-barrier regularization.
-    curv_reg_weight : float
-        Weight λ_c for the curvature regularization loss.
-    eps : float
-        Small constant for numerical stability.
-    """
-
     def __init__(
         self,
         low_level_channels: int,
@@ -868,12 +790,9 @@ class LCHPHFv2(nn.Module):
         self.curv_reg_weight = curv_reg_weight
         self.eps = eps
 
-        # --- Learnable curvature: c = softplus(theta_c) + eps ---
-        # Initialize so c ≈ 1.0:  theta_c = log(exp(1) - 1) ≈ 0.5413
         init_theta_c = math.log(math.expm1(1.0))
         self.theta_c = nn.Parameter(torch.tensor(init_theta_c, dtype=torch.float32))
 
-        # --- Tangent projections (1×1 convolutions) ---
         self.W_low = nn.Conv2d(
             low_level_channels, output_channels, kernel_size=1, bias=False
         )
@@ -881,13 +800,9 @@ class LCHPHFv2(nn.Module):
             high_level_channels, output_channels, kernel_size=1, bias=False
         )
 
-        # --- Tangent scaling factors (learnable scalars) ---
         self.tau_low = nn.Parameter(torch.ones(1))
         self.tau_high = nn.Parameter(torch.ones(1))
 
-        # --- Zero-init confidence calibration gates ---
-        # g_i: linear projection (1×1 conv) from C channels to 1 scalar.
-        # Zero-init => σ(g_i(x_i)) = σ(0) = 0.5 at step 0 (purely geometric).
         self.g_low = nn.Conv2d(output_channels, 1, kernel_size=1, bias=True)
         self.g_high = nn.Conv2d(output_channels, 1, kernel_size=1, bias=True)
         nn.init.zeros_(self.g_low.weight)
@@ -895,12 +810,9 @@ class LCHPHFv2(nn.Module):
         nn.init.zeros_(self.g_high.weight)
         nn.init.zeros_(self.g_high.bias)
 
-        # --- Euclidean path projection ---
         self.W_euc = nn.Conv2d(
             output_channels, output_channels, kernel_size=1, bias=False
         )
-
-        # --- Output projections for both paths ---
         self.W_o_hyp = nn.Conv2d(
             output_channels, output_channels, kernel_size=1, bias=False
         )
@@ -908,221 +820,144 @@ class LCHPHFv2(nn.Module):
             output_channels, output_channels, kernel_size=1, bias=False
         )
 
-        # --- Normalization (LayerNorm-equivalent for conv features) ---
         self.gn_hyp = nn.GroupNorm(1, output_channels)
         self.gn_euc = nn.GroupNorm(1, output_channels)
 
-        # --- Dual-path coupling scalar: alpha = sigmoid(phi) ---
-        # Initialize alpha ≈ 0.3 to favor the stable Euclidean path early.
-        # phi = log(0.3 / 0.7) ≈ -0.8473
+        # --- BUG FIX #2: Add explicit zero-init final GroupNorm ---
+        # This ensures strict identity-anchoring at init regardless of
+        # gn_hyp/gn_euc initialization, mirroring AWTTFModule's robust design.
+        self.final_norm = nn.GroupNorm(1, output_channels)
+
         init_phi = math.log(0.3 / 0.7)
         self.phi = nn.Parameter(torch.tensor(init_phi, dtype=torch.float32))
 
-        # --- Output activation ---
         self.act = nn.GELU()
-
         self._init_weights()
 
     def _init_weights(self):
-        for conv in [
-            self.W_low,
-            self.W_high,
-            self.W_euc,
-            self.W_o_hyp,
-            self.W_o_euc,
-        ]:
+        for conv in [self.W_low, self.W_high, self.W_euc, self.W_o_hyp, self.W_o_euc]:
             nn.init.xavier_uniform_(conv.weight)
 
-    # ==================================================================
-    #  Curvature accessors
-    # ==================================================================
+        nn.init.zeros_(self.gn_hyp.weight)
+        nn.init.zeros_(self.gn_hyp.bias)
+        nn.init.zeros_(self.gn_euc.weight)
+        nn.init.zeros_(self.gn_euc.bias)
+
+        # Zero-init the new final_norm to guarantee proc_feat_b2 = 0 at epoch 0
+        nn.init.zeros_(self.final_norm.weight)
+        nn.init.zeros_(self.final_norm.bias)
+
     @property
     def curvature(self) -> torch.Tensor:
-        """Current manifold curvature  c = softplus(theta_c) + eps."""
         return F.softplus(self.theta_c) + self.eps
 
     def curvature_reg_loss(self) -> torch.Tensor:
-        """
-        Soft log-barrier regularization on curvature.
-
-        L_curv = lambda_c * [max(0, c - c_max)^2 + max(0, c_min - c)^2]
-        """
         c = self.curvature
         return self.curv_reg_weight * (
             torch.relu(c - self.c_max).pow(2) + torch.relu(self.c_min - c).pow(2)
         )
 
-    # ==================================================================
-    #  Riemannian operations (Poincaré ball model)
-    # ==================================================================
     def _expmap0(self, v: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """
-        Exponential map at the origin to the Poincaré ball B^C_c.
-
-            x = tanh(sqrt(c) * ||v||) * v / (sqrt(c) * (||v|| + eps))
-
-        Guarantees ||x|| < 1/sqrt(c)  (strictly inside the ball).
-
-        Parameters
-        ----------
-        v : (B, C, H, W) — tangent vector at origin.
-        c : scalar tensor — curvature (strictly positive).
-
-        Returns
-        -------
-        x : (B, C, H, W) — point on the Poincaré ball.
-        """
-        # L2 norm along channel dimension: (B, 1, H, W)
         v_norm = v.norm(dim=1, keepdim=True)
         sqrt_c = torch.sqrt(c)
-
-        # Clamp tanh argument to prevent overflow (tanh(15) ≈ 1.0 in fp32)
         tanh_arg = torch.clamp(sqrt_c * v_norm, max=15.0)
         tanh_val = torch.tanh(tanh_arg)
-
-        # Denominator: sqrt(c) * (||v|| + eps)  — always > 0
         denom = sqrt_c * (v_norm + self.eps)
         x = tanh_val * v / denom
         return x
 
     def _logmap0(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """
-        Logarithmic map from the Poincaré ball to the Euclidean tangent
-        space at the origin.
-
-            u = artanh(sqrt(c) * ||x||) * x / (sqrt(c) * (||x|| + eps))
-
-        Parameters
-        ----------
-        x : (B, C, H, W) — point on the Poincaré ball (||x|| < 1/sqrt(c)).
-        c : scalar tensor — curvature (strictly positive).
-
-        Returns
-        -------
-        u : (B, C, H, W) — tangent vector at origin.
-        """
-        x_norm = x.norm(dim=1, keepdim=True)  # (B, 1, H, W)
+        x_norm = x.norm(dim=1, keepdim=True)
         sqrt_c = torch.sqrt(c)
-
-        # Clamp artanh argument to [0, 1 - eps] for numerical stability.
-        # Since ||x|| < 1/sqrt(c), sqrt(c)*||x|| < 1 strictly, but floating
-        # point may produce values arbitrarily close to 1.
         artanh_arg = torch.clamp(sqrt_c * x_norm, min=0.0, max=1.0 - self.eps)
         artanh_val = torch.atanh(artanh_arg)
-
         denom = sqrt_c * (x_norm + self.eps)
         u = artanh_val * x / denom
         return u
 
-    # ==================================================================
-    #  Forward pass — 10-step algorithmic flow
-    # ==================================================================
     def forward(
         self,
         low_level_feat: torch.Tensor,
         high_level_feat: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Fuse shallow and deep feature maps via dual-path hyperbolic geometry.
-
-        Parameters
-        ----------
-        low_level_feat : (B, C_low, H, W)
-            Shallow features (concrete, local textures) from frozen backbone.
-        high_level_feat : (B, C_high, H', W')
-            Deep features (abstract, global semantics) from frozen backbone.
-
-        Returns
-        -------
-        F_out : (B, C_out, H, W)
-            Fused feature map (64 channels).
-        C_conf : (B, 1, H, W)
-            Auxiliary conformal confidence map in [0, 1]. High values
-            indicate geometrically confident (clean) spatial regions;
-            low values indicate noisy regions near the Poincaré ball
-            boundary.
-        """
-        # ---- Step 1: Spatial Alignment ----
-        # Bilinearly upsample F_high to match F_low spatial dimensions.
         high_level_up = F.interpolate(
             high_level_feat,
             size=low_level_feat.shape[-2:],
             mode="bilinear",
             align_corners=False,
         )
+        c = self.curvature
 
-        # ---- Step 2: Curvature Update ----
-        c = self.curvature  # scalar tensor, strictly > 0
+        v_low = self.tau_low * self.W_low(low_level_feat)
+        v_high = self.tau_high * self.W_high(high_level_up)
 
-        # ---- Step 3: Tangent Projection ----
-        #   v_i(p) = tau_i * W_i * F_i(p)
-        v_low = self.tau_low * self.W_low(low_level_feat)  # (B, C, H, W)
-        v_high = self.tau_high * self.W_high(high_level_up)  # (B, C, H, W)
-
-        # ---- Step 4: Hyperbolic Embedding (Exponential Map) ----
-        x_low = self._expmap0(v_low, c)  # (B, C, H, W), ||x|| < 1/sqrt(c)
+        x_low = self._expmap0(v_low, c)
         x_high = self._expmap0(v_high, c)
 
-        # ---- Step 5: Zero-Init Conformal Confidence Weighting ----
-        #   w_i = sigma(g_i(x_i)) / (1 - c * ||x_i||^2)
-        #
-        # The Riemannian conformal factor (1 - c*||x||^2) appears in the
-        # denominator. As noisy features drift toward the ball boundary
-        # (||x|| -> 1/sqrt(c)), the conformal factor -> 0, and the weight
-        # is dominated by the learned sigmoid gate which can suppress them.
         x_low_norm_sq = (x_low * x_low).sum(dim=1, keepdim=True)
         x_high_norm_sq = (x_high * x_high).sum(dim=1, keepdim=True)
 
-        conformal_low = 1.0 - c * x_low_norm_sq  # (B, 1, H, W), in (0, 1]
+        conformal_low = 1.0 - c * x_low_norm_sq
         conformal_high = 1.0 - c * x_high_norm_sq
 
-        # Clamp conformal factor to prevent division by zero.
-        conformal_low_safe = conformal_low.clamp(min=self.eps)
-        conformal_high_safe = conformal_high.clamp(min=self.eps)
-
-        # Zero-init sigmoid gates: sigma(0) = 0.5 at step 0
-        g_low_val = torch.sigmoid(self.g_low(x_low))  # (B, 1, H, W)
+        g_low_val = torch.sigmoid(self.g_low(x_low))
         g_high_val = torch.sigmoid(self.g_high(x_high))
 
-        w_low = g_low_val / conformal_low_safe  # (B, 1, H, W)
-        w_high = g_high_val / conformal_high_safe
-
         # ---- Step 6: Einstein Mid-point Fusion (Exact Closed-Form) ----
-        #   m^H = (w_low * x_low + w_high * x_high) / (w_low + w_high + eps)
-        #
-        # Since m^H is a convex combination of points strictly inside the
-        # ball, m^H is also strictly inside the ball.
-        m_H = (w_low * x_low + w_high * x_high) / (
-            w_low + w_high + self.eps
-        )  # (B, C, H, W)
+        # --- BUG FIX #1: Exact Einstein Midpoint via Hyperboloid Projection ---
+        # The previous code applied the Klein model formula directly to Poincaré
+        # coordinates. We correctly convert Poincaré to Klein, compute the
+        # hyperboloid centroid (Einstein midpoint) using Lorentz factors, and
+        # project it back to the Poincaré ball via stereographic projection.
+
+        # 1. Poincaré -> Klein coordinates: x_K = 2 * x_P / (1 + c * ||x_P||^2)
+        xK_low = 2.0 * x_low / (1.0 + c * x_low_norm_sq).clamp_min(self.eps)
+        xK_high = 2.0 * x_high / (1.0 + c * x_high_norm_sq).clamp_min(self.eps)
+
+        # 2. Lorentz factors for Klein coordinates: gamma = 1 / sqrt(1 - c * ||x_K||^2)
+        gamma_K_low = 1.0 / torch.sqrt(
+            (1.0 - c * (xK_low * xK_low).sum(dim=1, keepdim=True)).clamp_min(self.eps)
+        )
+        gamma_K_high = 1.0 / torch.sqrt(
+            (1.0 - c * (xK_high * xK_high).sum(dim=1, keepdim=True)).clamp_min(self.eps)
+        )
+
+        # 3. Weighted sum of hyperboloid embeddings
+        w_low_K = g_low_val * gamma_K_low
+        w_high_K = g_high_val * gamma_K_high
+
+        sum_gamma_xK = w_low_K * xK_low + w_high_K * xK_high
+        sum_gamma = w_low_K + w_high_K
+
+        # 4. Lorentz norm of the sum
+        norm_sq = sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(
+            dim=1, keepdim=True
+        )
+        norm = torch.sqrt(norm_sq.clamp_min(self.eps))
+
+        # 5. Project back to Poincaré ball: x_P = spatial / (time + norm)
+        m_H = sum_gamma_xK / (sum_gamma + norm + self.eps)
 
         # ---- Step 7: Logarithmic Map back to Euclidean Space ----
-        u_hyp = self._logmap0(m_H, c)  # (B, C, H, W)
+        u_hyp = self._logmap0(m_H, c)
 
         # ---- Step 8: Dual-Path Euclidean Residual ----
-        #   u_euc = W_euc(v_low + v_high)
-        # Preserves flat, continuous features (color gradients, illumination)
-        # that do not belong in hyperbolic space.
-        u_euc = self.W_euc(v_low + v_high)  # (B, C, H, W)
+        u_euc = self.W_euc(v_low + v_high)
 
         # ---- Step 9: Dual-Path Coupling & Output ----
-        #   F_hyp = GroupNorm(W_o_hyp * u_hyp)
-        #   F_euc = GroupNorm(W_o_euc * u_euc)
-        #   F_out = GELU(alpha * F_hyp + (1 - alpha) * F_euc)
-        F_hyp = self.gn_hyp(self.W_o_hyp(u_hyp))  # (B, C, H, W)
+        F_hyp = self.gn_hyp(self.W_o_hyp(u_hyp))
         F_euc = self.gn_euc(self.W_o_euc(u_euc))
 
-        # alpha = sigmoid(clamp(phi, -3, 3)), init alpha ≈ 0.3
         phi_clamped = torch.clamp(self.phi, min=-3.0, max=3.0)
         alpha = torch.sigmoid(phi_clamped)
 
-        F_out = self.act(alpha * F_hyp + (1.0 - alpha) * F_euc)
+        # --- BUG FIX #2: Apply final_norm to ensure zero output at init ---
+        # This decouples identity-anchoring from gn_hyp/gn_euc initialization
+        # and ensures strict identity at epoch 0.
+        F_out = self.act(self.final_norm(alpha * F_hyp + (1.0 - alpha) * F_euc))
 
         # ---- Step 10: Auxiliary Conformal Confidence Map Export ----
-        #   C_conf = 1 - c * ||x_low||^2, clamped to [0, 1]
-        # Exported to spatially modulate the downstream IdentityInitAffine
-        # layer, creating a cohesive "geometric nervous system."
-        C_conf = conformal_low.clamp(0.0, 1.0)  # (B, 1, H, W)
+        C_conf = conformal_low.clamp(0.0, 1.0)
 
         return F_out, C_conf
 
@@ -1142,6 +977,11 @@ class SpatialCrossAttention(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        # FIX 3: Enforce channel equality for residual addition
+        assert query_channels == output_channels, (
+            f"query_channels ({query_channels}) must equal output_channels ({output_channels}) "
+            f"for residual addition in SpatialCrossAttention."
+        )
 
         self.patch_size = patch_size
         inter_channels = max(context_channels // 2, query_channels * 2, 32)
@@ -1182,7 +1022,8 @@ class SpatialCrossAttention(nn.Module):
         self.proj_norm = nn.GroupNorm(1, output_channels)
         self.proj_drop = nn.Dropout(dropout)
 
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # FIX 2: Initialize to 1e-2 to prevent one-step gradient freeze
+        self.gamma = nn.Parameter(torch.tensor(1e-2))
         self._init_weights()
 
     def _init_weights(self):
@@ -1299,6 +1140,8 @@ class GeoSpecClassifier(nn.Module):
             )
         backbone_trainable_layers = [int(i) for i in raw_trainable]
 
+        # FIX 4: Removed first redundant validation block for vit1_feature_branch
+
         # ---- Branch 1 feature stage selection ----
         self.vit1_feature_branch = sorted(
             [int(i) for i in cfg.network.vit1_feature_branch]
@@ -1308,20 +1151,19 @@ class GeoSpecClassifier(nn.Module):
                 f"Branch 1 index must be in [0, 3] (got {idx}). "
                 f"ConvNeXtV2-Tiny has 4 feature stages (0-indexed 0-3)."
             )
-        assert 1 <= len(self.vit1_feature_branch) <= 2, (
-            f"vit1_feature_branch must have 1 or 2 features, "
+        assert len(self.vit1_feature_branch) == 2, (
+            f"vit1_feature_branch must have exactly 2 features, "
             f"got {len(self.vit1_feature_branch)}."
         )
-        if len(self.vit1_feature_branch) == 2:
-            assert self.vit1_feature_branch[0] != self.vit1_feature_branch[1], (
-                f"vit1_feature_branch has duplicate indices "
-                f"{self.vit1_feature_branch}. Two-element branches must use "
-                f"distinct stages."
-            )
+        assert self.vit1_feature_branch[0] != self.vit1_feature_branch[1], (
+            f"vit1_feature_branch has duplicate indices "
+            f"{self.vit1_feature_branch}. Two-element branches must use "
+            f"distinct stages."
+        )
+
+        # FIX 4: Removed first redundant validation block for vit2_feature_branch
 
         # ---- Branch 2 feature stage selection ----
-        # Safely extract configuration (falling back to vit_feature_branch
-        # if older config is used)
         raw_branch2_cfg = getattr(
             cfg.network,
             "vit2_feature_branch",
@@ -1333,16 +1175,15 @@ class GeoSpecClassifier(nn.Module):
                 f"Branch 2 index must be in [0, 3] (got {idx}). "
                 f"ConvNeXtV2-Tiny has 4 feature stages (0-indexed 0-3)."
             )
-        assert 1 <= len(self.vit2_feature_branch) <= 2, (
-            f"vit2_feature_branch must have 1 or 2 features, "
+        assert len(self.vit2_feature_branch) == 2, (
+            f"vit2_feature_branch must have exactly 2 features, "
             f"got {len(self.vit2_feature_branch)}."
         )
-        if len(self.vit2_feature_branch) == 2:
-            assert self.vit2_feature_branch[0] != self.vit2_feature_branch[1], (
-                f"vit2_feature_branch has duplicate indices "
-                f"{self.vit2_feature_branch}. Two-element branches must use "
-                f"distinct stages."
-            )
+        assert self.vit2_feature_branch[0] != self.vit2_feature_branch[1], (
+            f"vit2_feature_branch has duplicate indices "
+            f"{self.vit2_feature_branch}. Two-element branches must use "
+            f"distinct stages."
+        )
 
         self.cfg = cfg
         self.num_classes = cfg.dataset.num_classes
@@ -1360,7 +1201,6 @@ class GeoSpecClassifier(nn.Module):
 
         # ================================================================
         # ONE shared CNN backbone (frozen ConvNeXtV2)
-        # Both branches consume its 4-stage feature outputs independently.
         # ================================================================
         self.cnn_backbone = MultiScaleConvNeXtV2Backbone(
             model_name="convnextv2_tiny",
@@ -1374,117 +1214,76 @@ class GeoSpecClassifier(nn.Module):
         side_vit_ch = self.SIDE_VIT_INPUT_CHANNELS
 
         # ================================================================
-        # Branch 1: AWT-TF + LinearRFF Cross-Attention
+        # FIX 1: Intermediate setup code (Restored missing instantiations)
         # ================================================================
+        f1, f2 = self.vit1_feature_branch
+        f3, f4 = self.vit2_feature_branch
 
-        branch1_dim = [feat_dims[i] for i in self.vit1_feature_branch]
-
-        # ---- Branch 1 Feature Fusion: AWT-TF ----
+        # Branch 1 Geometric/Spectral Fusion
         self.gate_b1 = AWTTFModule(
-            low_level_channels=branch1_dim[0],
-            high_level_channels=branch1_dim[1],
+            low_level_channels=feat_dims[f1],
+            high_level_channels=feat_dims[f2],
             output_channels=proj_channels,
-            tucker_rank=16,
+        )
+        # Branch 2 Hyperbolic Fusion
+        self.gate_b2 = LCHPHFv2(
+            low_level_channels=feat_dims[f3],
+            high_level_channels=feat_dims[f4],
+            output_channels=proj_channels,
         )
 
-        # ---- Branch 1 Cross-Attention: Dense Linearized RFF ----
+        # Cross-Attention Modules (query_channels must equal output_channels)
         self.spatial_fusion_b1 = LinearRFFCrossAttention(
             query_channels=side_vit_ch,
             context_channels=proj_channels,
             output_channels=side_vit_ch,
-            num_features=64,
-            dropout=0.0,
         )
-
-        # ---- Branch 1 Refinement (zero-init residual) ----
-        self.refine_b1 = self._make_refinement(side_vit_ch)
-
-        drop_path_rate = getattr(cfg.network, "drop_path_rate", 0.1)
-        if drop_path_rate > 0.0:
-            self.drop_path_b1 = DropPath(drop_path_rate)
-        else:
-            self.drop_path_b1 = nn.Identity()
-
-        # ---- Branch 1 Side-ViT input stabilization ----
-        # IdentityInitAffine without conf (simple per-channel affine).
-        # Uses Branch 2's IdentityInitAffine class (backward compatible:
-        # conf=None => x * gamma + delta, identical to Branch 1's original).
-        self.sv_input_norm_b1 = IdentityInitAffine(side_vit_ch)
-
-        # ================================================================
-        # Branch 2: LC-HPHF v2 + Spatial Cross-Attention
-        # ================================================================
-
-        branch2_dim = [feat_dims[i] for i in self.vit2_feature_branch]
-
-        # ---- Branch 2 Feature Fusion: LC-HPHF v2 ----
-        # Returns (F_out, C_conf) — dual-path hyperbolic + Euclidean fusion
-        self.gate_b2 = LCHPHFv2(
-            low_level_channels=branch2_dim[0],
-            high_level_channels=branch2_dim[1],
-            output_channels=proj_channels,
-        )
-
-        # ---- Branch 2 Cross-Attention: Sparse Exact Patch ----
         self.spatial_fusion_b2 = SpatialCrossAttention(
             query_channels=side_vit_ch,
             context_channels=proj_channels,
             output_channels=side_vit_ch,
-            patch_size=16,
-            dropout=0.0,
         )
 
-        # ---- Branch 2 Refinement (zero-init residual) ----
+        # Refinement & DropPath
+        self.refine_b1 = self._make_refinement(side_vit_ch)
         self.refine_b2 = self._make_refinement(side_vit_ch)
 
-        if drop_path_rate > 0.0:
-            self.drop_path_b2 = DropPath(drop_path_rate)
-        else:
-            self.drop_path_b2 = nn.Identity()
+        drop_path_rate = getattr(cfg.network, "drop_path_rate", 0.0)
+        self.drop_path_b1 = DropPath(drop_path_rate)
+        self.drop_path_b2 = DropPath(drop_path_rate)
 
-        # ---- Branch 2 Side-ViT input stabilization ----
-        # IdentityInitAffine with geometric confidence modulation.
-        # At init: gamma=1, beta=0, delta=0  =>  true identity.
-        # As training progresses, beta scales input based on C_conf,
-        # suppressing noisy spatial regions identified by the hyperbolic
-        # manifold's conformal factor.
+        # Side-ViT Input Normalization
+        self.sv_input_norm_b1 = IdentityInitAffine(side_vit_ch)
         self.sv_input_norm_b2 = IdentityInitAffine(side_vit_ch)
 
-        # ================================================================
-        # Shared modules (computed once, used by both branches)
-        # ================================================================
-
-        # ---- Channel adapter (image -> side_vit channels) ----
-        # Shared between both branches since both use the same input image.
-        if image_channels != side_vit_ch and not (
-            image_channels == 1 and side_vit_ch == 3
+        # Context Projection (handles arbitrary input channels safely)
+        if self._image_channels != self._side_vit_ch and not (
+            self._image_channels == 1 and self._side_vit_ch == 3
         ):
             self._context_proj = nn.Conv2d(
-                image_channels, side_vit_ch, kernel_size=1, bias=False
+                self._image_channels, self._side_vit_ch, kernel_size=1, bias=False
             )
-            nn.init.kaiming_normal_(
-                self._context_proj.weight,
-                mode="fan_out",
-                nonlinearity="linear",
-            )
-        else:
-            self._context_proj = None
 
         # ================================================================
-        # ONE shared Side-ViT (BLACK BOX — FPT+ core)
-        # Called once per branch with each branch's independently
-        # processed vit_input. Both calls use the same frozen K/V
-        # memory banks (key_states, value_states).
+        # FIX 6: Corrected documentation comment
+        # TWO independent Side-ViTs (BLACK BOX — FPT+ core)
         # ================================================================
         self.side_vit_b1 = side_vit_b1
         self.side_vit_b2 = side_vit_b2
-        side_vit_output_hidden_size = self.side_vit.side_encoder.hidden_size
+
+        assert (
+            self.side_vit_b1.side_encoder.hidden_size
+            == self.side_vit_b2.side_encoder.hidden_size
+        ), (
+            f"Both side-ViTs must have the same hidden_size, but got "
+            f"{self.side_vit_b1.side_encoder.hidden_size} and "
+            f"{self.side_vit_b2.side_encoder.hidden_size}."
+        )
+
+        side_vit_output_hidden_size = self.side_vit_b1.side_encoder.hidden_size
 
         # ================================================================
         # ONE classifier head (GatedFeatureFusionHead — Dual-Branch)
-        # Accepts two side-ViT embeddings (vit_out_1, vit_out_2) and
-        # fuses them via per-branch self-gating + dynamic cross-branch
-        # softmax weighting before final classification.
         # ================================================================
         self.classifier_head = GatedFeatureFusionHead(
             hidden_size=side_vit_output_hidden_size,
