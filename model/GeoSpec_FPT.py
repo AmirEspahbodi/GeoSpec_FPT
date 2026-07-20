@@ -374,11 +374,7 @@ class UnifiedManifoldFusion(nn.Module):
         LH = (a - b + c - d) * 0.5
         HL = (a + b - c - d) * 0.5
         HH = (a - b - c + d) * 0.5
-        LH_sym = 0.5 * (LH + torch.flip(LH, dims=[-1]))
-        LH_anti = 0.5 * (LH - torch.flip(LH, dims=[-1]))
-        HL_sym = 0.5 * (HL + torch.flip(HL, dims=[-1]))
-        HL_anti = 0.5 * (HL - torch.flip(HL, dims=[-1]))
-        return LL, LH_sym, LH_anti, HL_sym, HL_anti, HH
+        return LL, LH, HL, HH
 
     @staticmethod
     def _haar_idwt_2d(ll, lh, hl, hh):
@@ -410,18 +406,6 @@ class UnifiedManifoldFusion(nn.Module):
         artanh_val = torch.atanh(torch.clamp(sqrt_c * x_norm, min=0.0, max=1.0 - self.eps))
         return artanh_val * x / (sqrt_c * (x_norm + self.eps))
 
-    def _einstein_midpoint(self, x1, x2, w1, w2, c):
-        """Exact Einstein midpoint via Klein model projection."""
-        xK1 = 2.0 * x1 / (1.0 + c * (x1 * x1).sum(dim=1, keepdim=True)).clamp_min(self.eps)
-        xK2 = 2.0 * x2 / (1.0 + c * (x2 * x2).sum(dim=1, keepdim=True)).clamp_min(self.eps)
-        gamma1 = 1.0 / torch.sqrt((1.0 - c * (xK1 * xK1).sum(dim=1, keepdim=True)).clamp_min(self.eps))
-        gamma2 = 1.0 / torch.sqrt((1.0 - c * (xK2 * xK2).sum(dim=1, keepdim=True)).clamp_min(self.eps))
-        w1_act = w1 * gamma1
-        w2_act = w2 * gamma2
-        sum_gamma_xK = w1_act * xK1 + w2_act * xK2
-        sum_gamma = w1_act + w2_act
-        norm = torch.sqrt((sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(dim=1, keepdim=True)).clamp_min(self.eps))
-        return sum_gamma_xK / (sum_gamma + norm + self.eps)
 
     def _disentangle_norm_loss(self, x_lc, x_ls, x_hc, x_hs):
         content_norm = (x_lc.norm(dim=1, keepdim=True).mean() + x_hc.norm(dim=1, keepdim=True).mean()) / 2.0
@@ -438,10 +422,8 @@ class UnifiedManifoldFusion(nn.Module):
         w2_act = w2 * gamma2
         sum_gamma_xK = w1_act * xK1 + w2_act * xK2
         sum_gamma = w1_act + w2_act
-        norm = torch.sqrt((sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(dim=1, keepdim=True)).clamp_min(self.eps))
-        m_K = sum_gamma_xK / (sum_gamma + norm + self.eps)
-        # Convert Klein coordinates back to Poincaré ball coordinates
-        m_P = m_K / (1.0 + torch.sqrt((1.0 - c * (m_K * m_K).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
+        m_Klein = sum_gamma_xK / sum_gamma.clamp_min(self.eps)
+        m_P = m_Klein / (1.0 + torch.sqrt((1.0 - c * (m_Klein * m_Klein).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
         return m_P
 
     def forward(self, low_level_feat, high_level_feat, wavelet_mask=None):
@@ -452,11 +434,7 @@ class UnifiedManifoldFusion(nn.Module):
         LL = low_level_feat
         high_freq_bands = []
         for level_idx in range(self.L):
-            LL, LH_sym, LH_anti, HL_sym, HL_anti, HH = self._haar_dwt_2d(LL)
-
-            # Fix for Bug 3: Reconstruct LH and HL before applying the mask
-            LH = LH_sym + LH_anti
-            HL = HL_sym + HL_anti
+            LL, LH, HL, HH = self._haar_dwt_2d(LL)
 
             if wavelet_mask is not None:
                 mask_l = wavelet_mask[:, :, level_idx]
@@ -475,7 +453,6 @@ class UnifiedManifoldFusion(nn.Module):
         P_LL = self.U_LL(LL_L)
         LL_fused = torch.einsum("bijk,bihw,bjhw->bkhw", G, P_high, P_LL)
 
-        # Fix for Bug 2: Squeeze the trailing dimension to get shape (3, 3)
         cos_t = torch.cos(self.theta_steer)
         sin_t = torch.sin(self.theta_steer)
         zero = torch.zeros_like(cos_t)
@@ -483,7 +460,7 @@ class UnifiedManifoldFusion(nn.Module):
         row_0 = torch.stack([cos_t, -sin_t, zero])
         row_1 = torch.stack([sin_t,  cos_t, zero])
         row_2 = torch.stack([zero,   zero,  one])
-        M_steer = torch.stack([row_0, row_1, row_2]).squeeze(-1)  # Shape: (3, 3)
+        M_steer = torch.stack([row_0, row_1, row_2]).squeeze(-1)
 
         G_bands_list = []
         modulated_bands = []
@@ -531,7 +508,6 @@ class UnifiedManifoldFusion(nn.Module):
         x_high_content = self._expmap0(v_high_content, c)
         x_high_style = self._expmap0(v_high_style, c)
 
-        # Fix for Bug 1: Convert Klein midpoint back to Poincaré ball
         xK_low = 2.0 * x_low_content / (1.0 + c * (x_low_content * x_low_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)
         xK_high = 2.0 * x_high_content / (1.0 + c * (x_high_content * x_high_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)
         gamma_K_low = 1.0 / torch.sqrt((1.0 - c * (xK_low * xK_low).sum(dim=1, keepdim=True)).clamp_min(self.eps))
@@ -540,10 +516,9 @@ class UnifiedManifoldFusion(nn.Module):
         w_low_K, w_high_K = g_low_val * gamma_K_low, g_high_val * gamma_K_high
         sum_gamma_xK = w_low_K * xK_low + w_high_K * xK_high
         sum_gamma = w_low_K + w_high_K
-        norm = torch.sqrt((sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(dim=1, keepdim=True)).clamp_min(self.eps))
 
-        m_K_content = sum_gamma_xK / (sum_gamma + norm + self.eps)
-        m_H_poinc = m_K_content / (1.0 + torch.sqrt((1.0 - c * (m_K_content * m_K_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
+        m_Klein_content = sum_gamma_xK / sum_gamma.clamp_min(self.eps)
+        m_H_poinc = m_Klein_content / (1.0 + torch.sqrt((1.0 - c * (m_Klein_content * m_Klein_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
 
         w_half = torch.tensor(0.5, device=x_low_style.device, dtype=x_low_style.dtype)
         x_style = self._einstein_midpoint(x_low_style, x_high_style, w_half, w_half, c)
@@ -572,7 +547,9 @@ class UnifiedManifoldFusion(nn.Module):
             "disentangle_norm": self._disentangle_norm_loss(x_low_content, x_low_style, x_high_content, x_high_style),
             "bayesian_prior": (self.coarse_prior_logits ** 2).sum() * 0.1
         }
-        return F_out, C_conf, G_bands_out, x_style, aux_losses
+
+        return F_out, C_conf, G_bands_out, x_style, aux_losses, F_hyp
+
 
 class LinearRFFCrossAttention(nn.Module):
     def __init__(self, query_channels, context_channels, output_channels, num_features=64, dropout=0.0, fold_id=0, pad_factor=16):
@@ -862,9 +839,9 @@ class GeoSpecClassifier(nn.Module):
     def _pipeline(self, features, context, key_states, value_states, fusion_out=None, wavelet_mask=None):
         if fusion_out is None:
             F_low, F_high = features[self.feature_branch[0]], features[self.feature_branch[1]]
-            proc_feat, C_conf, G_bands, x_style, aux_losses = self.fusion_module(F_low, F_high, wavelet_mask)
+            proc_feat, C_conf, G_bands, x_style, aux_losses, F_hyp = self.fusion_module(F_low, F_high, wavelet_mask)
         else:
-            proc_feat, C_conf, G_bands, x_style, aux_losses = fusion_out
+            proc_feat, C_conf, G_bands, x_style, aux_losses, F_hyp = fusion_out
 
         self._last_aux_losses = aux_losses
 
@@ -876,7 +853,6 @@ class GeoSpecClassifier(nn.Module):
         cls_embedding = self.side_vit(vit_input, key_states, value_states)
         logits = self.classifier_head(cls_embedding)
 
-        # Fix for Bug 1: Map Poincaré x_style back to tangent space (Euclidean) for domain classifier
         c = self.fusion_module.curvature
         x_style_tan = self.fusion_module._logmap0(x_style, c)
         x_style_gap = F.adaptive_avg_pool2d(x_style_tan, 1).flatten(1)
@@ -886,7 +862,8 @@ class GeoSpecClassifier(nn.Module):
             "logits": logits, "domain_logits": domain_logits, "aux_losses": aux_losses,
             "G_bands": G_bands, "C_conf": C_conf, "cls_embedding": cls_embedding,
             "x_style": x_style, "grounding_attn": grounding_attn,
-            "hyp_dist_matrix": self._compute_hyperbolic_distance(cls_embedding)
+            "hyp_dist_matrix": self._compute_hyperbolic_distance(cls_embedding),
+            "F_hyp": F_hyp
         }
 
     def get_auxiliary_losses(self):
@@ -899,16 +876,15 @@ class GeoSpecClassifier(nn.Module):
         F_low, F_high = features[self.feature_branch[0]], features[self.feature_branch[1]]
         fusion_out_nomask = self.fusion_module(F_low, F_high, None)
         proc_feat_nomask = fusion_out_nomask[0]
+        F_hyp_nomask = fusion_out_nomask[5]
 
         # Explicit Bilateral Equivariance Loss
         if compute_equivariance:
             x_flip = torch.flip(x, dims=[-1])
-            # FIX: Removed torch.no_grad() to allow symmetric gradient flow
-            # for both the original and flipped paths through the backbone.
             features_flip = self.cnn_backbone(x_flip)
             F_low_flip, F_high_flip = features_flip[self.feature_branch[0]], features_flip[self.feature_branch[1]]
-            proc_feat_flip, _, _, _, _ = self.fusion_module(F_low_flip, F_high_flip, None)
-            sym_loss = F.l1_loss(proc_feat_nomask, torch.flip(proc_feat_flip, dims=[-1]))
+            _, _, _, _, _, F_hyp_flip = self.fusion_module(F_low_flip, F_high_flip, None)
+            sym_loss = F.l1_loss(F_hyp_nomask, torch.flip(F_hyp_flip, dims=[-1]))
         else:
             sym_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
@@ -949,7 +925,6 @@ class GeoSpecClassifier(nn.Module):
             p.requires_grad = True
             tta_params.append(p)
 
-        # FIX: Lazily instantiate optimizer once and update parameters to preserve momentum buffers
         if self._tta_optimizer is None:
             self._tta_optimizer = torch.optim.SGD(tta_params, lr=self.tta_lr, momentum=0.9)
         else:
@@ -964,11 +939,18 @@ class GeoSpecClassifier(nn.Module):
         entropy = -(p * torch.log(p + 1e-8)).sum(dim=-1)
 
         e0 = 0.4 * math.log(self.num_classes)
-        reliable_mask = entropy < e0
+        entropy_reliable = entropy < e0
+
+        conf_per_sample = C_conf.mean(dim=[1, 2, 3])
+        conf_reliable = conf_per_sample > 0.5
+        reliable_mask = entropy_reliable & conf_reliable
 
         if reliable_mask.any():
-            ent_loss = entropy[reliable_mask].mean()
-            reg_loss = sum(((p - self._tta_init_params[n]) ** 2).sum() for n, p in self.sv_input_norm.named_parameters())
+            conf_weight = self.tta_lambda_conf * conf_per_sample[reliable_mask] + (1 - self.tta_lambda_conf)
+            ent_loss = (entropy[reliable_mask] * conf_weight).mean()
+
+            reg_loss = sum(((param - self._tta_init_params[n]) ** 2).sum() for n, param in self.sv_input_norm.named_parameters())
+
             loss = ent_loss + 0.1 * reg_loss
             self._tta_optimizer.zero_grad()
             loss.backward()
