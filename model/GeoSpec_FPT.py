@@ -303,10 +303,9 @@ class UnifiedManifoldFusion(nn.Module):
         )
         self.theta_steer = nn.Parameter(torch.zeros(1))
 
-        # Bayesian Anatomical Structural Prior (Soft HH suppression)
         self.coarse_prior_logits = nn.Parameter(torch.zeros(self.L, 3))
         if self.L > 0:
-            self.coarse_prior_logits.data[0, 2] = -1.0  # Soft init suppression
+            self.coarse_prior_logits.data[0, 2] = -1.0
 
         # ================================================================
         # Hyperbolic Path
@@ -322,14 +321,15 @@ class UnifiedManifoldFusion(nn.Module):
 
         self.P_c = nn.Conv2d(C_out, C_out, kernel_size=1, bias=False)
         self.P_s = nn.Conv2d(C_out, C_out, kernel_size=1, bias=False)
-        self.rho_c = nn.Parameter(torch.tensor(0.5))
-        self.rho_s = nn.Parameter(torch.tensor(0.1))
+
+        self.register_buffer("rho_c", torch.tensor(0.5))
+        self.register_buffer("rho_s", torch.tensor(0.1))
 
         # ================================================================
         # Chart-Transition Coupling (Psi) & Einstein Midpoint
         # ================================================================
         self.psi = nn.Conv2d(C_out, C_out, kernel_size=1, bias=False)
-        self.einstein_weight = nn.Parameter(torch.tensor(0.0))  # Learns mixing weight
+        self.einstein_weight = nn.Parameter(torch.tensor(0.0))
 
         self.W_euc = nn.Conv2d(C_out, C_out, kernel_size=1, bias=False)
         self.W_o_hyp = nn.Conv2d(C_out, C_out, kernel_size=1, bias=False)
@@ -363,7 +363,8 @@ class UnifiedManifoldFusion(nn.Module):
             self.P_s.weight.data.zero_()
             self.psi.weight.data.copy_(eye.view(self.output_channels, self.output_channels, 1, 1))
         for gn in [self.gn_hyp, self.gn_euc, self.final_norm]:
-            nn.init.zeros_(gn.weight); nn.init.zeros_(gn.bias)
+            nn.init.ones_(gn.weight)
+            nn.init.zeros_(gn.bias)
 
     @staticmethod
     def _haar_dwt_2d(x: torch.Tensor):
@@ -427,6 +428,22 @@ class UnifiedManifoldFusion(nn.Module):
         style_norm = (x_ls.norm(dim=1, keepdim=True).mean() + x_hs.norm(dim=1, keepdim=True).mean()) / 2.0
         return (content_norm - self.rho_c).pow(2) + (style_norm - self.rho_s).pow(2)
 
+    def _einstein_midpoint(self, x1, x2, w1, w2, c):
+        """Exact Einstein midpoint via Klein model projection."""
+        xK1 = 2.0 * x1 / (1.0 + c * (x1 * x1).sum(dim=1, keepdim=True)).clamp_min(self.eps)
+        xK2 = 2.0 * x2 / (1.0 + c * (x2 * x2).sum(dim=1, keepdim=True)).clamp_min(self.eps)
+        gamma1 = 1.0 / torch.sqrt((1.0 - c * (xK1 * xK1).sum(dim=1, keepdim=True)).clamp_min(self.eps))
+        gamma2 = 1.0 / torch.sqrt((1.0 - c * (xK2 * xK2).sum(dim=1, keepdim=True)).clamp_min(self.eps))
+        w1_act = w1 * gamma1
+        w2_act = w2 * gamma2
+        sum_gamma_xK = w1_act * xK1 + w2_act * xK2
+        sum_gamma = w1_act + w2_act
+        norm = torch.sqrt((sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(dim=1, keepdim=True)).clamp_min(self.eps))
+        m_K = sum_gamma_xK / (sum_gamma + norm + self.eps)
+        # Convert Klein coordinates back to Poincaré ball coordinates
+        m_P = m_K / (1.0 + torch.sqrt((1.0 - c * (m_K * m_K).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
+        return m_P
+
     def forward(self, low_level_feat, high_level_feat, wavelet_mask=None):
         B, C_low, H_low, W_low = low_level_feat.shape
 
@@ -436,13 +453,17 @@ class UnifiedManifoldFusion(nn.Module):
         high_freq_bands = []
         for level_idx in range(self.L):
             LL, LH_sym, LH_anti, HL_sym, HL_anti, HH = self._haar_dwt_2d(LL)
-            if wavelet_mask is not None:
-                mask_l = wavelet_mask[:, :, level_idx]
-                LH_sym = LH_sym * mask_l[:, 0:1].view(B, 1, 1, 1)
-                HL_sym = HL_sym * mask_l[:, 1:2].view(B, 1, 1, 1)
-                HH = HH * mask_l[:, 2:3].view(B, 1, 1, 1)
+
+            # Fix for Bug 3: Reconstruct LH and HL before applying the mask
             LH = LH_sym + LH_anti
             HL = HL_sym + HL_anti
+
+            if wavelet_mask is not None:
+                mask_l = wavelet_mask[:, :, level_idx]
+                LH = LH * mask_l[:, 0:1].view(B, 1, 1, 1)
+                HL = HL * mask_l[:, 1:2].view(B, 1, 1, 1)
+                HH = HH * mask_l[:, 2:3].view(B, 1, 1, 1)
+
             high_freq_bands.append((LH, HL, HH))
         LL_L = LL
 
@@ -454,8 +475,15 @@ class UnifiedManifoldFusion(nn.Module):
         P_LL = self.U_LL(LL_L)
         LL_fused = torch.einsum("bijk,bihw,bjhw->bkhw", G, P_high, P_LL)
 
-        cos_t, sin_t = torch.cos(self.theta_steer), torch.sin(self.theta_steer)
-        M_steer = torch.tensor([[cos_t, -sin_t, 0.0], [sin_t, cos_t, 0.0], [0.0, 0.0, 1.0]], device=LL_fused.device, dtype=LL_fused.dtype)
+        # Fix for Bug 2: Squeeze the trailing dimension to get shape (3, 3)
+        cos_t = torch.cos(self.theta_steer)
+        sin_t = torch.sin(self.theta_steer)
+        zero = torch.zeros_like(cos_t)
+        one = torch.ones_like(cos_t)
+        row_0 = torch.stack([cos_t, -sin_t, zero])
+        row_1 = torch.stack([sin_t,  cos_t, zero])
+        row_2 = torch.stack([zero,   zero,  one])
+        M_steer = torch.stack([row_0, row_1, row_2]).squeeze(-1)  # Shape: (3, 3)
 
         G_bands_list = []
         modulated_bands = []
@@ -464,7 +492,7 @@ class UnifiedManifoldFusion(nn.Module):
             stacked = torch.cat([LH_l, HL_l, HH_l], dim=1)
             G_bands_raw = self.mlp_bands(F.adaptive_avg_pool2d(stacked, 1).flatten(1)).view(B, 3, self.output_channels)
             G_hat = torch.einsum("ij,bjk->bik", M_steer, G_bands_raw)
-            G_hat = G_hat + self.coarse_prior_logits[l].view(1, 3, 1)  # Bayesian soft prior
+            G_hat = G_hat + self.coarse_prior_logits[l].view(1, 3, 1)
             G_hat = F.softmax(G_hat, dim=1)
             G_bands_list.append(G_hat)
 
@@ -490,9 +518,20 @@ class UnifiedManifoldFusion(nn.Module):
         g_low_val = torch.sigmoid(self.g_low(x_low_poinc))
         g_high_val = torch.sigmoid(self.g_high(x_high_poinc))
 
-        x_low_content, x_low_style = self.P_c(x_low_poinc), self.P_s(x_low_poinc)
-        x_high_content, x_high_style = self.P_c(x_high_poinc), self.P_s(x_high_poinc)
+        v_low_tan = self._logmap0(x_low_poinc, c)
+        v_high_tan = self._logmap0(x_high_poinc, c)
 
+        v_low_content = self.P_c(v_low_tan)
+        v_low_style = self.P_s(v_low_tan)
+        v_high_content = self.P_c(v_high_tan)
+        v_high_style = self.P_s(v_high_tan)
+
+        x_low_content = self._expmap0(v_low_content, c)
+        x_low_style = self._expmap0(v_low_style, c)
+        x_high_content = self._expmap0(v_high_content, c)
+        x_high_style = self._expmap0(v_high_style, c)
+
+        # Fix for Bug 1: Convert Klein midpoint back to Poincaré ball
         xK_low = 2.0 * x_low_content / (1.0 + c * (x_low_content * x_low_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)
         xK_high = 2.0 * x_high_content / (1.0 + c * (x_high_content * x_high_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)
         gamma_K_low = 1.0 / torch.sqrt((1.0 - c * (xK_low * xK_low).sum(dim=1, keepdim=True)).clamp_min(self.eps))
@@ -502,16 +541,21 @@ class UnifiedManifoldFusion(nn.Module):
         sum_gamma_xK = w_low_K * xK_low + w_high_K * xK_high
         sum_gamma = w_low_K + w_high_K
         norm = torch.sqrt((sum_gamma * sum_gamma - c * (sum_gamma_xK * sum_gamma_xK).sum(dim=1, keepdim=True)).clamp_min(self.eps))
-        m_H = sum_gamma_xK / (sum_gamma + norm + self.eps)
 
-        x_style = (x_low_style + x_high_style) / 2.0
+        m_K_content = sum_gamma_xK / (sum_gamma + norm + self.eps)
+        m_H_poinc = m_K_content / (1.0 + torch.sqrt((1.0 - c * (m_K_content * m_K_content).sum(dim=1, keepdim=True)).clamp_min(self.eps)))
+
+        w_half = torch.tensor(0.5, device=x_low_style.device, dtype=x_low_style.dtype)
+        x_style = self._einstein_midpoint(x_low_style, x_high_style, w_half, w_half, c)
 
         # 3. Genuine Chart-Transition Coupling via Einstein Midpoint
         x_freq_poinc = self._expmap0(u_freq, c)
         w1 = torch.sigmoid(self.einstein_weight)
         w2 = 1.0 - w1
-        m_unified = self._einstein_midpoint(m_H, x_freq_poinc, w1, w2, c)
-        u_unified = self._logmap0(m_unified, c)
+
+        m_unified_poinc = self._einstein_midpoint(m_H_poinc, x_freq_poinc, w1, w2, c)
+
+        u_unified = self._logmap0(m_unified_poinc, c)
 
         # 4. Dual-Path Euclidean Residual & Output
         u_euc = self.W_euc(v_low + v_high)
@@ -581,11 +625,11 @@ class LinearRFFCrossAttention(nn.Module):
         q, k = q * self.scale, k * self.scale
         phi_q, phi_k = self._phi(q), self._phi(k)
 
-        # Grounding Attention Map via RFF Kernel Approximation
-        attn_map = torch.bmm(phi_q, phi_k.transpose(1, 2))
-        attn_map = attn_map / (attn_map.sum(dim=-1, keepdim=True) + 1e-6)
+        mean_phi_q = phi_q.mean(dim=1, keepdim=True)  # (B, 1, D)
+        grounding = torch.bmm(mean_phi_q, phi_k.transpose(1, 2))  # (B, 1, N_k)
+        grounding = grounding / (grounding.sum(dim=-1, keepdim=True) + 1e-6)
         H_ctx, W_ctx = context_feat.shape[-2], context_feat.shape[-1]
-        grounding_attn = attn_map.mean(dim=1).view(B, 1, H_ctx, W_ctx)
+        grounding_attn = grounding.view(B, 1, H_ctx, W_ctx)
 
         # Linear Attention Forward
         k_context = torch.bmm(phi_k.transpose(1, 2), v)
@@ -600,7 +644,6 @@ class LinearRFFCrossAttention(nn.Module):
         return query_feat + self.gamma * enhancement, grounding_attn
 
 
-
 class SpatialCrossAttention(nn.Module):
     def __init__(
         self,
@@ -611,7 +654,6 @@ class SpatialCrossAttention(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        # FIX 3: Enforce channel equality for residual addition
         assert query_channels == output_channels, (
             f"query_channels ({query_channels}) must equal output_channels ({output_channels}) "
             f"for residual addition in SpatialCrossAttention."
@@ -656,7 +698,6 @@ class SpatialCrossAttention(nn.Module):
         self.proj_norm = nn.GroupNorm(1, output_channels)
         self.proj_drop = nn.Dropout(dropout)
 
-        # FIX 2: Initialize to 1e-2 to prevent one-step gradient freeze
         self.gamma = nn.Parameter(torch.tensor(1e-2))
         self._init_weights()
 
@@ -775,6 +816,8 @@ class GeoSpecClassifier(nn.Module):
         self.tta_lambda_conf = getattr(cfg.network, "tta_lambda_conf", 1.0)
         self._last_aux_losses = {}
 
+        self._tta_init_params = None
+
     @staticmethod
     def _make_refinement(channels: int) -> nn.Module:
         refine = nn.Sequential(
@@ -816,9 +859,13 @@ class GeoSpecClassifier(nn.Module):
 
         return (2.0 / torch.sqrt(c)) * torch.atanh(torch.clamp(torch.sqrt(c) * mobius_norm, max=1.0 - eps))
 
-    def _pipeline(self, features, context, key_states, value_states, wavelet_mask=None):
-        F_low, F_high = features[self.feature_branch[0]], features[self.feature_branch[1]]
-        proc_feat, C_conf, G_bands, x_style, aux_losses = self.fusion_module(F_low, F_high, wavelet_mask)
+    def _pipeline(self, features, context, key_states, value_states, fusion_out=None, wavelet_mask=None):
+        if fusion_out is None:
+            F_low, F_high = features[self.feature_branch[0]], features[self.feature_branch[1]]
+            proc_feat, C_conf, G_bands, x_style, aux_losses = self.fusion_module(F_low, F_high, wavelet_mask)
+        else:
+            proc_feat, C_conf, G_bands, x_style, aux_losses = fusion_out
+
         self._last_aux_losses = aux_losses
 
         vit_input, grounding_attn = self.cross_attn(context, proc_feat)
@@ -829,7 +876,10 @@ class GeoSpecClassifier(nn.Module):
         cls_embedding = self.side_vit(vit_input, key_states, value_states)
         logits = self.classifier_head(cls_embedding)
 
-        x_style_gap = F.adaptive_avg_pool2d(x_style, 1).flatten(1)
+        # Fix for Bug 1: Map Poincaré x_style back to tangent space (Euclidean) for domain classifier
+        c = self.fusion_module.curvature
+        x_style_tan = self.fusion_module._logmap0(x_style, c)
+        x_style_gap = F.adaptive_avg_pool2d(x_style_tan, 1).flatten(1)
         domain_logits = self.domain_classifier(x_style_gap)
 
         return {
@@ -842,35 +892,54 @@ class GeoSpecClassifier(nn.Module):
     def get_auxiliary_losses(self):
         return self._last_aux_losses if self._last_aux_losses else {}
 
-    def forward(self, x, key_states, value_states, use_causal_mask=False):
+    def forward(self, x, key_states, value_states, use_causal_mask=False, compute_equivariance=True):
         features = self.cnn_backbone(x)
         context = self._prepare_context(x)
 
+        F_low, F_high = features[self.feature_branch[0]], features[self.feature_branch[1]]
+        fusion_out_nomask = self.fusion_module(F_low, F_high, None)
+        proc_feat_nomask = fusion_out_nomask[0]
+
         # Explicit Bilateral Equivariance Loss
-        x_flip = torch.flip(x, dims=[-1])
-        with torch.no_grad():
+        if compute_equivariance:
+            x_flip = torch.flip(x, dims=[-1])
+            # FIX: Removed torch.no_grad() to allow symmetric gradient flow
+            # for both the original and flipped paths through the backbone.
             features_flip = self.cnn_backbone(x_flip)
-        proc_feat, _, _, _, _ = self.fusion_module(features[self.feature_branch[0]], features[self.feature_branch[1]], None)
-        proc_feat_flip, _, _, _, _ = self.fusion_module(features_flip[self.feature_branch[0]], features_flip[self.feature_branch[1]], None)
-        sym_loss = F.l1_loss(proc_feat, torch.flip(proc_feat_flip, dims=[-1]))
+            F_low_flip, F_high_flip = features_flip[self.feature_branch[0]], features_flip[self.feature_branch[1]]
+            proc_feat_flip, _, _, _, _ = self.fusion_module(F_low_flip, F_high_flip, None)
+            sym_loss = F.l1_loss(proc_feat_nomask, torch.flip(proc_feat_flip, dims=[-1]))
+        else:
+            sym_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         if use_causal_mask and self.training:
             B, L = x.shape[0], self.fusion_module.L
             wavelet_mask = torch.randint(0, 2, (B, 3, L), device=x.device).float()
-            out_nomask = self._pipeline(features, context, key_states, value_states, wavelet_mask=None)
-            out_masked = self._pipeline(features, context, key_states, value_states, wavelet_mask=wavelet_mask)
+
+            out_nomask = self._pipeline(features, context, key_states, value_states, fusion_out=fusion_out_nomask, wavelet_mask=None)
+            nomask_aux_losses = self._last_aux_losses.copy()
+
+            out_masked = self._pipeline(features, context, key_states, value_states, fusion_out=None, wavelet_mask=wavelet_mask)
+            self._last_aux_losses = nomask_aux_losses
+
             result = dict(out_nomask)
             result["masked_logits"] = out_masked["logits"]
             result["sym_loss"] = sym_loss
             return result
         else:
-            result = self._pipeline(features, context, key_states, value_states, wavelet_mask=None)
+            result = self._pipeline(features, context, key_states, value_states, fusion_out=fusion_out_nomask, wavelet_mask=None)
             result["sym_loss"] = sym_loss
             return result
 
+    def reset_tta_state(self):
+        """Initializes or resets the persistent TTA parameters for anti-forgetting regularization."""
+        self._tta_init_params = {n: p.data.clone() for n, p in self.sv_input_norm.named_parameters()}
+        self._tta_optimizer = None
+
     def tta_step(self, x, key_states, value_states):
         """Tent/EATA-style TTA with reliable sample selection and anti-forgetting."""
-        init_params = {n: p.data.clone() for n, p in self.sv_input_norm.named_parameters()}
+        if self._tta_init_params is None:
+            self.reset_tta_state()
 
         req_grad_state = {n: p.requires_grad for n, p in self.named_parameters()}
         for n, p in self.named_parameters(): p.requires_grad = False
@@ -880,27 +949,30 @@ class GeoSpecClassifier(nn.Module):
             p.requires_grad = True
             tta_params.append(p)
 
-        optimizer = torch.optim.SGD(tta_params, lr=self.tta_lr, momentum=0.9)
+        # FIX: Lazily instantiate optimizer once and update parameters to preserve momentum buffers
+        if self._tta_optimizer is None:
+            self._tta_optimizer = torch.optim.SGD(tta_params, lr=self.tta_lr, momentum=0.9)
+        else:
+            self._tta_optimizer.param_groups[0]['params'] = tta_params
+
         was_training = self.training
         self.eval()
 
-        outputs = self.forward(x, key_states, value_states, use_causal_mask=False)
+        outputs = self.forward(x, key_states, value_states, use_causal_mask=False, compute_equivariance=False)
         logits, C_conf = outputs["logits"], outputs["C_conf"]
         p = F.softmax(logits, dim=-1)
         entropy = -(p * torch.log(p + 1e-8)).sum(dim=-1)
 
-        # EATA reliable sample selection
         e0 = 0.4 * math.log(self.num_classes)
         reliable_mask = entropy < e0
 
         if reliable_mask.any():
             ent_loss = entropy[reliable_mask].mean()
-            # Anti-forgetting regularization
-            reg_loss = sum(((p - init_params[n]) ** 2).sum() for n, p in self.sv_input_norm.named_parameters())
+            reg_loss = sum(((p - self._tta_init_params[n]) ** 2).sum() for n, p in self.sv_input_norm.named_parameters())
             loss = ent_loss + 0.1 * reg_loss
-            optimizer.zero_grad()
+            self._tta_optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            self._tta_optimizer.step()
 
         for n, p in self.named_parameters(): p.requires_grad = req_grad_state[n]
         self.zero_grad()
@@ -922,16 +994,25 @@ class GeoSpecClassifier(nn.Module):
     def compute_hsm(self, x, target_class, key_states, value_states):
         x = x.clone().detach().requires_grad_(True)
         with torch.enable_grad():
-            outputs = self.forward(x, key_states, value_states, use_causal_mask=False)
+            outputs = self.forward(x, key_states, value_states, use_causal_mask=False, compute_equivariance=False)
             cls_embedding = outputs["cls_embedding"]
             c = self.fusion_module.curvature
             z_poinc = self.fusion_module._expmap0(cls_embedding.unsqueeze(-1).unsqueeze(-1), c).squeeze(-1).squeeze(-1)
             proto = self.class_prototypes[target_class].unsqueeze(0).expand_as(z_poinc)
             proto_poinc = self.fusion_module._expmap0(proto.unsqueeze(-1).unsqueeze(-1), c).squeeze(-1).squeeze(-1)
 
-            diff = z_poinc - proto_poinc
+            neg_z = -z_poinc
+            dot_np = (neg_z * proto_poinc).sum(dim=-1, keepdim=True)
+            norm_n_sq = (neg_z ** 2).sum(dim=-1, keepdim=True)
+            norm_p_sq = (proto_poinc ** 2).sum(dim=-1, keepdim=True)
+
+            numerator = ((1 + 2 * c * dot_np + c * norm_p_sq) * neg_z + (1 - c * norm_n_sq) * proto_poinc)
+            denominator = (1 + 2 * c * dot_np + c**2 * norm_n_sq * norm_p_sq).clamp_min(self.fusion_module.eps)
+            mobius_norm = (numerator / denominator).norm(dim=-1, keepdim=True)
+
             dist = (2.0 / torch.sqrt(c)) * torch.atanh(
-                torch.clamp(torch.sqrt(c) * diff.norm(dim=-1, keepdim=True), max=1.0 - 1e-5)
+                torch.clamp(torch.sqrt(c) * mobius_norm, max=1.0 - self.fusion_module.eps)
             ).sum()
+
             grad = torch.autograd.grad(dist, x, create_graph=False)[0]
         return grad.norm(dim=1)
