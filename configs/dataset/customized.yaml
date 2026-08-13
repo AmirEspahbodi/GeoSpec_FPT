@@ -4,9 +4,9 @@ name: "customized"
 # ------------------------------------------------------------------
 # Paths & Directories
 # ------------------------------------------------------------------
-data_path: "D:/work/GeoSpec_FPT/dataset"
-preload_path: "D:/work/GeoSpec_FPT/preload_dataset"
-save_path: "D:/work/GeoSpec_FPT/save"
+data_path: "/content/GeoSpec_FPT/dataset"
+preload_path: "/content/GeoSpec_FPT/preload_dataset"
+save_path: "/content/GeoSpec_FPT/save"
 
 # ------------------------------------------------------------------
 # Image & Dataset Properties
