@@ -574,6 +574,29 @@ class ViTPreTrainedModel(PreTrainedModel):
             module.gradient_checkpointing = value
 
 
+    def get_head_mask(
+        self, head_mask: Optional[torch.Tensor], num_hidden_layers: int, is_attention_chunked: bool = False
+    ):
+        """
+        Prepare the head mask if needed.
+        Transformers 5.x removed this helper from PreTrainedModel, so we restore it here.
+        """
+        if head_mask is not None:
+            # Convert 1D or 2D head_mask to 5D
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
+
+            head_mask = head_mask.to(dtype=self.dtype)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+            return head_mask
+        else:
+            return [None] * num_hidden_layers
+
 VIT_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass. Use it
     as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage and

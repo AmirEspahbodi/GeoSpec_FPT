@@ -36,7 +36,7 @@ argparse.ArgumentParser._check_help = patched_check_help
 def pil_loader(path):
     with open(path, "rb") as f:
         img = Image.open(f)
-    return img.convert("RGB")
+        return img.convert("RGB")
 
 
 class FineImageFolder(datasets.ImageFolder):

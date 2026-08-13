@@ -29,8 +29,8 @@ def _filter_fields(cls: Any, data: Dict[str, Any]) -> Dict[str, Any]:
 @dataclass
 class DatasetConfig:
     name: str = ""
-    data_path: str = "./data"
-    preload_path: str = "./preloaded"
+    data_path: str = "./dataset"
+    preload_path: str = "./preload_dataset"
     save_path: str = ""
     input_size: int = 384
     image_channels: int = 3
