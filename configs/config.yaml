@@ -1,16 +1,76 @@
 defaults:
+  - optional dataset: customized
+  - optional network: FPT+
   - _self_
-  - network: FPT+ # set to FPT to use the FPT network
-  - dataset: messidor2 # define a new yaml file in /config/dataset to apply your own dataset configuration
-  - solver: adamw # note that learning rate is set in the dataset configuration
-  - data_config
-  - train_config
 
+# ------------------------------------------------------------------
+# Base Settings
+# ------------------------------------------------------------------
 base:
-  device: cuda:0
-  random_seed: -1 # set to -1 to disable random seed
-  cudnn_deterministic: false # set to True to turn on CUDNN deterministic setting, but it may slow down your training
-  overwrite: false # overwrite save_path
-  progress: true # real-time metric display, output cannot be redirected
-  checkpoint: null # path to the checkpoint to resume
-  
+  device: "cuda"
+  random_seed: -1
+
+# ------------------------------------------------------------------
+# Training & Dataloader
+# ------------------------------------------------------------------
+train:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  epochs: 50
+  warmup_epochs: 2.0
+  grad_clip: 1.0
+  amp: true
+
+# ------------------------------------------------------------------
+# Optimizer & Scheduler
+# ------------------------------------------------------------------
+optimizer:
+  learning_rate: 0.0005
+  min_lr: 0.000001
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 0.00000001
+
+# ------------------------------------------------------------------
+# Loss weights
+# ------------------------------------------------------------------
+loss:
+  ce_weight: 1.0
+  evid_weight: 0.1
+  evid_ramp_epochs: 2.0
+  evid_kl_lambda: 1.0
+  evid_kl_anneal_epochs: 10
+  curvature_weight: 0.1
+  disentangle_weight: 0.1
+  bayesian_weight: 0.1
+  branch_weight: 1.0
+  sym_weight: 0.0
+  sym_start_epoch: 1
+  sym_ramp_epochs: 1
+  domain_weight: 0.0
+  domain_start_epoch: 5
+  domain_ramp_epochs: 5
+
+# ------------------------------------------------------------------
+# Reproducibility / logging / checkpointing
+# ------------------------------------------------------------------
+logging:
+  seed: 42
+  deterministic: false
+  output_dir: "./runs/geospec"
+  log_interval: 20
+  eval_interval: 1
+  save_interval: 1
+  resume: ""
+  max_nonfinite_steps: 5
+
+# ------------------------------------------------------------------
+# Hydra behaviour
+# ------------------------------------------------------------------
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: .

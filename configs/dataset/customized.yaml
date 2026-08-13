@@ -1,9 +1,35 @@
-name: customized
-data_path: ??? # path to the dataset
-preload_path: ??? # path to the preloaded data
-save_path: ./runs/exp # path to save the experiment results
-input_size: 512 # image resolution for the LPM
-num_classes: ??? # number of classes
-mean: 'auto' # 'auto' or a list of three numbers for RGB
-std: 'auto' # 'auto' or a list of three numbers for RGB
-learning_rate: 0.0001 # dataset-specific learning rate
+# @package dataset
+name: "customized"
+
+# ------------------------------------------------------------------
+# Paths & Directories
+# ------------------------------------------------------------------
+data_path: "D:/work/GeoSpec_FPT/dataset"
+preload_path: "D:/work/GeoSpec_FPT/preload_dataset"
+save_path: "D:/work/GeoSpec_FPT/save"
+
+# ------------------------------------------------------------------
+# Image & Dataset Properties
+# ------------------------------------------------------------------
+input_size: 512
+image_channels: 3
+num_classes: 2
+mean: [0.6105489, 0.6105489, 0.6105489]
+std: [0.25847816, 0.25847816, 0.25847816]
+
+# ------------------------------------------------------------------
+# Splits & Preload Directories
+# ------------------------------------------------------------------
+train_split: "train"
+val_split: "val"
+test_split: "test"
+train_preload_dir: ""
+val_preload_dir: ""
+test_preload_dir: ""
+
+# ------------------------------------------------------------------
+# Domain & Augmentation
+# ------------------------------------------------------------------
+domain_metadata_path: ""
+num_domains: 0
+use_augmentation: false

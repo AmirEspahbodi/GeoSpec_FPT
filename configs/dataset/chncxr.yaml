@@ -1,9 +1,29 @@
-name: chncxr
-data_path: /path/to/dataset/CHNCXR/
-preload_path: ./preload_data/chncxr
-save_path: ./runs/chncxr
-input_size: 512 # image resolution for the LPM
-num_classes: 2 # number of classes
-mean: [0.6105489, 0.6105489, 0.6105489] # 'auto' or a list of three numbers for RGB
-std: [0.25847816, 0.25847816, 0.25847816] # 'auto' or a list of three numbers for RGB
-learning_rate: 0.0005 # dataset-specific learning rate
+# @package dataset
+
+name: "chncxr"
+
+data_path: "/path/to/dataset/CHNCXR/"
+preload_path: "./preload_data/chncxr"
+save_path: "./runs/chncxr"
+
+input_size: 512
+num_classes: 2
+
+mean: [0.6105489, 0.6105489, 0.6105489]
+std: [0.25847816, 0.25847816, 0.25847816]
+
+learning_rate: 0.0005
+
+train_split: "train"
+val_split: "val"
+test_split: "test"
+
+train_preload_dir: ""
+val_preload_dir: ""
+test_preload_dir: ""
+
+domain_metadata_path: ""
+
+image_channels: 3
+num_domains: 0
+use_augmentation: false

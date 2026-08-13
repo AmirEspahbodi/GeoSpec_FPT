@@ -1,4 +1,0 @@
-optimizer: SGD
-weight_decay: 0.00005 # set to 0 to disable weight decay
-momentum: 0.9 # set to 0 to disable momentum
-nesterov: true

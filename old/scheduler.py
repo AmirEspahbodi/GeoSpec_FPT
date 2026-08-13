@@ -2,7 +2,7 @@ import torch
 from torch.utils.data.sampler import Sampler
 
 
-class WarmupLRScheduler():
+class WarmupLRScheduler:
     def __init__(self, optimizer, warmup_epochs, initial_lr):
         self.epoch = 0
         self.optimizer = optimizer
@@ -14,7 +14,7 @@ class WarmupLRScheduler():
             self.epoch += 1
             curr_lr = (self.epoch / self.warmup_epochs) * self.initial_lr
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = curr_lr
+                param_group["lr"] = curr_lr
 
     def is_finish(self):
         return self.epoch >= self.warmup_epochs
@@ -39,13 +39,17 @@ class ScheduledWeightedSampler(Sampler):
     def step(self):
         if self.decay_rate < 1:
             self.epoch += 1
-            factor = self.decay_rate**(self.epoch - 1)
+            factor = self.decay_rate ** (self.epoch - 1)
             self.weights = factor * self.w0 + (1 - factor) * self.wf
             for i, _class in enumerate(self.targets):
                 self.sample_weight[i] = self.weights[_class]
 
     def __iter__(self):
-        return iter(torch.multinomial(self.sample_weight, self.num_samples, replacement=True).tolist())
+        return iter(
+            torch.multinomial(
+                self.sample_weight, self.num_samples, replacement=True
+            ).tolist()
+        )
 
     def __len__(self):
         return self.num_samples
@@ -60,7 +64,7 @@ class ScheduledWeightedSampler(Sampler):
         return class_weights
 
 
-class LossWeightsScheduler():
+class LossWeightsScheduler:
     def __init__(self, dataset, decay_rate):
         self.dataset = dataset
         self.decay_rate = decay_rate
@@ -77,7 +81,7 @@ class LossWeightsScheduler():
         weights = self.w0
         if self.decay_rate < 1:
             self.epoch += 1
-            factor = self.decay_rate**(self.epoch - 1)
+            factor = self.decay_rate ** (self.epoch - 1)
             weights = factor * self.w0 + (1 - factor) * self.wf
         return weights
 
