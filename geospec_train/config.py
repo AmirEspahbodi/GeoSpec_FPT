@@ -47,7 +47,7 @@ class DatasetConfig:
     domain_metadata_path: str = ""
     num_domains: int = 0
     use_augmentation: bool = False
-    data_augmentation_args: list[str] = []
+    data_augmentation_args: list[str] = field(default_factory=list[str])
 
     def __post_init__(self) -> None:
         if not isinstance(self.mean, str):
