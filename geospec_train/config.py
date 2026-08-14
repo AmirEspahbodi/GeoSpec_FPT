@@ -31,6 +31,7 @@ class DatasetConfig:
     name: str = ""
     data_path: str = "./dataset"
     preload_path: str = "./preload_dataset"
+    output_dir: str = ""
     save_path: str = ""
     input_size: int = 384
     image_channels: int = 3
@@ -46,6 +47,7 @@ class DatasetConfig:
     domain_metadata_path: str = ""
     num_domains: int = 0
     use_augmentation: bool = False
+    data_augmentation_args: list[str] = []
 
     def __post_init__(self) -> None:
         if not isinstance(self.mean, str):

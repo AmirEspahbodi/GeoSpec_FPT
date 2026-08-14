@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from .config import TrainConfig
+from .config import CoreConfig
 
 
 def _should_no_decay(name: str, param: torch.Tensor) -> bool:
@@ -83,24 +83,24 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     ]
 
 
-def build_optimizer(cfg: TrainConfig, model: nn.Module) -> AdamW:
+def build_optimizer(cfg: CoreConfig, model: nn.Module) -> AdamW:
     param_groups = build_param_groups(
         model=model,
-        weight_decay=cfg.weight_decay,
+        weight_decay=cfg.optimizer.weight_decay,
     )
 
     optimizer = AdamW(
         param_groups,
-        lr=float(cfg.learning_rate),
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
-        eps=float(cfg.adam_eps),
+        lr=float(cfg.optimizer.learning_rate),
+        betas=(float(cfg.optimizer.adam_beta1), float(cfg.optimizer.adam_beta2)),
+        eps=float(cfg.optimizer.adam_eps),
     )
 
     return optimizer
 
 
 def build_scheduler(
-    cfg: TrainConfig,
+    cfg: CoreConfig,
     optimizer: torch.optim.Optimizer,
     steps_per_epoch: int,
 ) -> LambdaLR:
@@ -108,14 +108,14 @@ def build_scheduler(
     Linear warmup + cosine decay without restarts.
     Scheduler is stepped per iteration.
     """
-    warmup_steps = int(float(cfg.warmup_epochs) * float(steps_per_epoch))
-    total_steps = int(float(cfg.epochs) * float(steps_per_epoch))
+    warmup_steps = int(float(cfg.train.warmup_epochs) * float(steps_per_epoch))
+    total_steps = int(float(cfg.train.epochs) * float(steps_per_epoch))
 
     if total_steps <= 0:
         raise ValueError("Total training steps must be positive.")
 
-    base_lr = float(cfg.learning_rate)
-    min_lr = float(cfg.min_lr)
+    base_lr = float(cfg.optimizer.learning_rate)
+    min_lr = float(cfg.optimizer.min_lr)
 
     if base_lr <= 0:
         raise ValueError("learning_rate must be positive.")

@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .config import TrainConfig
+from .config import CoreConfig
 
 
 def _load_evidential_loss():
@@ -75,7 +75,7 @@ class LossOrchestrator:
 
     def __init__(
         self,
-        cfg: TrainConfig,
+        cfg: CoreConfig,
         num_classes: int,
         device: torch.device,
     ):
@@ -84,14 +84,14 @@ class LossOrchestrator:
         self.device = device
 
         class_weight: Optional[torch.Tensor] = None
-        if cfg.class_weights is not None:
-            if len(cfg.class_weights) != num_classes:
+        if cfg.loss.class_weights is not None:
+            if len(cfg.loss.class_weights) != num_classes:
                 raise ValueError(
-                    f"class_weights length {len(cfg.class_weights)} does not match "
+                    f"class_weights length {len(cfg.loss.class_weights)} does not match "
                     f"num_classes {num_classes}."
                 )
             class_weight = torch.tensor(
-                cfg.class_weights,
+                cfg.loss.class_weights,
                 dtype=torch.float32,
                 device=device,
             )
@@ -123,15 +123,15 @@ class LossOrchestrator:
         return min(1.0, max(0.0, progress))
 
     def _evidential_weight(self, epoch: int) -> float:
-        if self.cfg.evid_weight <= 0:
+        if self.cfg.loss.evid_weight <= 0:
             return 0.0
 
-        if self.cfg.evid_ramp_epochs <= 0:
-            return float(self.cfg.evid_weight)
+        if self.cfg.loss.evid_ramp_epochs <= 0:
+            return float(self.cfg.loss.evid_weight)
 
-        progress = float(epoch + 1) / float(self.cfg.evid_ramp_epochs)
+        progress = float(epoch + 1) / float(self.cfg.loss.evid_ramp_epochs)
         progress = min(1.0, max(0.0, progress))
-        return float(self.cfg.evid_weight) * progress
+        return float(self.cfg.loss.evid_weight) * progress
 
     def __call__(
         self,
@@ -154,11 +154,11 @@ class LossOrchestrator:
         # Primary CE loss
         # --------------------------------------------------------------
         ce_loss = torch.zeros((), device=device, dtype=torch.float32)
-        if self.cfg.ce_weight > 0 and outputs.get("logits") is not None:
+        if self.cfg.loss.ce_weight > 0 and outputs.get("logits") is not None:
             logits = outputs["logits"].float()
             ce_loss = finite_scalar(self.ce_loss(logits, labels), device)
 
-        total = total + float(self.cfg.ce_weight) * ce_loss
+        total = total + float(self.cfg.loss.ce_weight) * ce_loss
         logs["loss_ce"] = float(ce_loss.item())
 
         # --------------------------------------------------------------
@@ -176,9 +176,9 @@ class LossOrchestrator:
                 alpha,
                 labels,
                 self.num_classes,
-                self.cfg.evid_kl_lambda,
+                self.cfg.loss.evid_kl_lambda,
                 epoch,
-                self.cfg.evid_kl_anneal_epochs,
+                self.cfg.loss.evid_kl_anneal_epochs,
             )
 
             evid_loss = finite_scalar(evid_total, device)
@@ -197,9 +197,9 @@ class LossOrchestrator:
         aux_losses = outputs.get("aux_losses", {}) or {}
 
         auxiliary_terms = [
-            ("curvature_reg", float(self.cfg.curvature_weight)),
-            ("disentangle_norm", float(self.cfg.disentangle_weight)),
-            ("bayesian_prior", float(self.cfg.bayesian_weight)),
+            ("curvature_reg", float(self.cfg.loss.curvature_weight)),
+            ("disentangle_norm", float(self.cfg.loss.disentangle_weight)),
+            ("bayesian_prior", float(self.cfg.loss.bayesian_weight)),
         ]
 
         for key, weight in auxiliary_terms:
@@ -215,26 +215,26 @@ class LossOrchestrator:
         # Branch diversity loss
         # --------------------------------------------------------------
         branch_loss = torch.zeros((), device=device, dtype=torch.float32)
-        if self.cfg.branch_weight > 0:
+        if self.cfg.loss.branch_weight > 0:
             branch_source = aux_losses.get(
                 "branch_diversity",
                 outputs.get("branch_diversity_loss", None),
             )
             branch_loss = finite_scalar(branch_source, device)
 
-        total = total + float(self.cfg.branch_weight) * branch_loss
+        total = total + float(self.cfg.loss.branch_weight) * branch_loss
         logs["loss_branch_diversity"] = float(branch_loss.item())
-        logs["weight_branch_diversity"] = float(self.cfg.branch_weight)
+        logs["weight_branch_diversity"] = float(self.cfg.loss.branch_weight)
 
         # --------------------------------------------------------------
         # Symmetry/equivariance loss
         # --------------------------------------------------------------
         sym_weight = 0.0
-        if self.cfg.sym_weight > 0:
-            sym_weight = float(self.cfg.sym_weight) * self._ramp(
+        if self.cfg.loss.sym_weight > 0:
+            sym_weight = float(self.cfg.loss.sym_weight) * self._ramp(
                 epoch=epoch,
-                start_epoch=self.cfg.sym_start_epoch,
-                ramp_epochs=self.cfg.sym_ramp_epochs,
+                start_epoch=self.cfg.loss.sym_start_epoch,
+                ramp_epochs=self.cfg.loss.sym_ramp_epochs,
             )
 
         sym_loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -249,11 +249,11 @@ class LossOrchestrator:
         # Domain-adversarial loss
         # --------------------------------------------------------------
         domain_weight = 0.0
-        if self.cfg.domain_weight > 0:
-            domain_weight = float(self.cfg.domain_weight) * self._ramp(
+        if self.cfg.loss.domain_weight > 0:
+            domain_weight = float(self.cfg.loss.domain_weight) * self._ramp(
                 epoch=epoch,
-                start_epoch=self.cfg.domain_start_epoch,
-                ramp_epochs=self.cfg.domain_ramp_epochs,
+                start_epoch=self.cfg.loss.domain_start_epoch,
+                ramp_epochs=self.cfg.loss.domain_ramp_epochs,
             )
 
         domain_loss = torch.zeros((), device=device, dtype=torch.float32)

@@ -9,7 +9,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, default_collate
 from torchvision import datasets, transforms
 
-from .config import TrainConfig
+from .config import CoreConfig
 
 
 def _pil_loader(path: str, channels: int) -> Image.Image:
@@ -22,11 +22,11 @@ def _pil_loader(path: str, channels: int) -> Image.Image:
         return img
 
 
-def _normalize_stats(cfg: TrainConfig) -> Tuple[list[float], list[float]]:
-    mean = list(cfg.mean)
-    std = list(cfg.std)
+def _normalize_stats(cfg: CoreConfig) -> Tuple[list[float], list[float]]:
+    mean = list(cfg.dataset.mean)
+    std = list(cfg.dataset.std)
 
-    channels = int(cfg.image_channels)
+    channels = int(cfg.dataset.image_channels)
 
     if channels == 1:
         if len(mean) != 1:
@@ -47,7 +47,7 @@ def _normalize_stats(cfg: TrainConfig) -> Tuple[list[float], list[float]]:
     return [float(x) for x in mean], [float(x) for x in std]
 
 
-def build_transforms(cfg: TrainConfig, is_train: bool) -> transforms.Compose:
+def build_transforms(cfg: CoreConfig, is_train: bool) -> transforms.Compose:
     """
     Conservative deterministic preprocessing by default.
 
@@ -58,13 +58,13 @@ def build_transforms(cfg: TrainConfig, is_train: bool) -> transforms.Compose:
 
     ops = []
 
-    if is_train and cfg.use_augmentation:
+    if is_train and cfg.dataset.use_augmentation:
         # Deliberately minimal. Do not enable unless caches are regenerated.
         ops.append(transforms.RandomHorizontalFlip(p=0.5))
 
     ops.extend(
         [
-            transforms.Resize((cfg.image_size, cfg.image_size)),
+            transforms.Resize((cfg.network.input_size, cfg.network.input_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
@@ -73,12 +73,12 @@ def build_transforms(cfg: TrainConfig, is_train: bool) -> transforms.Compose:
     return transforms.Compose(ops)
 
 
-def resolve_preload_dir(cfg: TrainConfig, split: str) -> Path:
+def resolve_preload_dir(cfg: CoreConfig, split: str) -> Path:
     explicit = getattr(cfg, f"{split}_preload_dir", "")
     if explicit:
         return Path(explicit)
 
-    preload_path = Path(cfg.preload_path)
+    preload_path = Path(cfg.dataset.preload_path)
     split_dir = preload_path / split
 
     if split_dir.exists():
@@ -302,28 +302,28 @@ def preload_collate(
 
 
 def _make_dataset(
-    cfg: TrainConfig,
+    cfg: CoreConfig,
     split: str,
     transform: transforms.Compose,
 ) -> Optional[PreloadedImageDataset]:
-    root = Path(cfg.data_path) / split
+    root = Path(cfg.dataset.data_path) / split
     if not root.exists():
         return None
 
     preload_dir = resolve_preload_dir(cfg, split)
-    domain_map = load_domain_map(cfg.domain_metadata_path)
+    domain_map = load_domain_map(cfg.dataset.domain_metadata_path)
 
     return PreloadedImageDataset(
         root=root,
         preload_dir=preload_dir,
         transform=transform,
-        image_channels=cfg.image_channels,
+        image_channels=cfg.dataset.image_channels,
         domain_map=domain_map,
     )
 
 
 def build_dataloaders(
-    cfg: TrainConfig,
+    cfg: CoreConfig,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader]]:
     train_transform = build_transforms(cfg, is_train=True)
     eval_transform = build_transforms(cfg, is_train=False)
@@ -331,22 +331,22 @@ def build_dataloaders(
     train_dataset = _make_dataset(cfg, cfg.train_split, train_transform)
     if train_dataset is None:
         raise FileNotFoundError(
-            f"Training split not found: {Path(cfg.data_path) / cfg.train_split}"
+            f"Training split not found: {Path(cfg.dataset.data_path) / cfg.dataset.train_split}"
         )
 
-    val_dataset = _make_dataset(cfg, cfg.val_split, eval_transform)
-    test_dataset = _make_dataset(cfg, cfg.test_split, eval_transform)
+    val_dataset = _make_dataset(cfg, cfg.dataset.val_split, eval_transform)
+    test_dataset = _make_dataset(cfg, cfg.dataset.test_split, eval_transform)
 
     common_loader_kwargs = dict(
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        num_workers=cfg.train.num_workers,
+        pin_memory=cfg.train.pin_memory,
         collate_fn=preload_collate,
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=cfg.train.num_workers > 0,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg.batch_size,
+        batch_size=cfg.train.batch_size,
         shuffle=True,
         drop_last=True,
         **common_loader_kwargs,
@@ -356,7 +356,7 @@ def build_dataloaders(
     if val_dataset is not None:
         val_loader = DataLoader(
             val_dataset,
-            batch_size=cfg.batch_size,
+            batch_size=cfg.train.batch_size,
             shuffle=False,
             drop_last=False,
             **common_loader_kwargs,
@@ -366,7 +366,7 @@ def build_dataloaders(
     if test_dataset is not None:
         test_loader = DataLoader(
             test_dataset,
-            batch_size=cfg.batch_size,
+            batch_size=cfg.train.batch_size,
             shuffle=False,
             drop_last=False,
             **common_loader_kwargs,

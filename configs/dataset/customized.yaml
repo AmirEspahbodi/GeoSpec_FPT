@@ -7,6 +7,7 @@ name: "customized"
 data_path: "/content/GeoSpec_FPT/dataset"
 preload_path: "/content/GeoSpec_FPT/preload_dataset"
 save_path: "/content/GeoSpec_FPT/save"
+output_dir:  "/content/GeoSpec_FPT/output"
 
 # ------------------------------------------------------------------
 # Image & Dataset Properties
@@ -33,3 +34,4 @@ test_preload_dir: ""
 domain_metadata_path: ""
 num_domains: 0
 use_augmentation: false
+data_augmentation_args: []

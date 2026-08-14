@@ -1,13 +1,13 @@
 import os
 
 from torchvision import datasets
-
+from geospec_train.config import CoreConfig
 from old.data.transforms import data_transforms, simple_transform
 from old.data.dataset import PreloadImageFolder, AsymetricImageFolder
 from old.func import mean_and_std, print_dataset_info
 
 
-def generate_dataset(cfg):
+def generate_dataset(cfg: CoreConfig):
     if cfg.dataset.mean == "auto" or cfg.dataset.std == "auto":
         mean, std = auto_statistics(
             cfg.dataset.data_path,
@@ -37,7 +37,7 @@ def auto_statistics(data_path, input_size, batch_size, num_workers):
     return mean_and_std(train_dataset, batch_size, num_workers)
 
 
-def generate_dataset_from_folder(cfg, train_transform, test_transform):
+def generate_dataset_from_folder(cfg: CoreConfig, train_transform, test_transform):
     data_path = cfg.dataset.data_path
     preload_path = cfg.dataset.preload_path
 

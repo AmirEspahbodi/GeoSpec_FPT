@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from .config import TrainConfig
+from .config import CoreConfig
 
 
 def save_checkpoint(
@@ -17,7 +17,7 @@ def save_checkpoint(
     scheduler: Optional[Any],
     scaler: Optional[Any],
     best_metric: float,
-    cfg: TrainConfig,
+    cfg: CoreConfig,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

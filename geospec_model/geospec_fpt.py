@@ -1,6 +1,6 @@
 import math
 from typing import Any, Dict, List, Optional, Tuple
-
+from geospec_train.config import CoreConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1647,7 +1647,7 @@ class GeoSpecClassifier(nn.Module):
 
     SIDE_VIT_INPUT_CHANNELS: int = 3
 
-    def __init__(self, side_vit_b1: nn.Module, side_vit_b2: nn.Module, cfg: Any):
+    def __init__(self, side_vit_b1: nn.Module, side_vit_b2: nn.Module, cfg: CoreConfig):
         super().__init__()
         raw_trainable = getattr(cfg.network, "backbone_trainable_layers", []) or []
         for i in raw_trainable:
@@ -1666,7 +1666,7 @@ class GeoSpecClassifier(nn.Module):
         )
 
         self.num_classes = cfg.dataset.num_classes
-        image_channels = cfg.dataset.image_channel_num
+        image_channels = cfg.dataset.image_channels
         side_input_size = cfg.network.side_input_size
         assert side_input_size % 16 == 0
 

@@ -2,11 +2,12 @@ import torch
 from torchvision import transforms
 from packaging import version
 from copy import deepcopy
+from geospec_train.config import CoreConfig
 
 
-def data_transforms(cfg):
+def data_transforms(cfg: CoreConfig):
     weak_data_aug = ["horizontal_flip", "color_distortion", "random_crop"]
-    aug_args = cfg.data_augmentation_args
+    aug_args = cfg.dataset.data_augmentation_args
 
     def get_operations(aug_args, input_size):
         operations = {

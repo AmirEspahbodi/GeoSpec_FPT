@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .config import TrainConfig
+from .config import CoreConfig
 from .losses import LossOrchestrator
 from .metrics import ClassificationMetrics
 from .optim import build_optimizer, build_scheduler
@@ -23,7 +23,7 @@ def _prefix_dict(prefix: str, values: Dict[str, Any]) -> Dict[str, Any]:
 class Trainer:
     def __init__(
         self,
-        cfg: TrainConfig,
+        cfg: CoreConfig,
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader],
@@ -31,8 +31,8 @@ class Trainer:
     ):
         self.cfg = cfg
 
-        self.device = self._resolve_device(cfg.device)
-        self.use_amp = bool(cfg.amp) and self.device.type == "cuda"
+        self.device = self._resolve_device(cfg.base.device)
+        self.use_amp = bool(cfg.train.amp) and self.device.type == "cuda"
 
         self.model = model.to(self.device)
 
@@ -54,15 +54,15 @@ class Trainer:
 
         self.loss_orchestrator = LossOrchestrator(
             cfg=cfg,
-            num_classes=cfg.num_classes,
+            num_classes=cfg.dataset.num_classes,
             device=self.device,
         )
 
-        self.train_metrics = ClassificationMetrics(cfg.num_classes)
-        self.val_metrics = ClassificationMetrics(cfg.num_classes)
-        self.test_metrics = ClassificationMetrics(cfg.num_classes)
+        self.train_metrics = ClassificationMetrics(cfg.dataset.num_classes)
+        self.val_metrics = ClassificationMetrics(cfg.dataset.num_classes)
+        self.test_metrics = ClassificationMetrics(cfg.dataset.num_classes)
 
-        self.output_dir = Path(cfg.output_dir)
+        self.output_dir = Path(cfg.dataset.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.json_logger = JsonlLogger(self.output_dir / "metrics.jsonl")
@@ -73,7 +73,7 @@ class Trainer:
 
         if cfg.resume:
             self.start_epoch, self.best_metric = load_checkpoint(
-                path=cfg.resume,
+                path=cfg.logging.resume,
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
@@ -81,7 +81,7 @@ class Trainer:
             )
             self.start_epoch += 1
             self.console_logger.info(
-                f"Resumed from checkpoint {cfg.resume} at epoch {self.start_epoch}."
+                f"Resumed from checkpoint {cfg.logging.resume} at epoch {self.start_epoch}."
             )
 
         self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -118,7 +118,7 @@ class Trainer:
 
             # Symmetry pass is expensive; only compute it when it will be used.
             compute_equivariance = (
-                self.cfg.sym_weight > 0 and epoch >= self.cfg.sym_start_epoch
+                self.cfg.loss.sym_weight > 0 and epoch >= self.cfg.loss.sym_start_epoch
             )
 
             with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -149,7 +149,7 @@ class Trainer:
                     }
                 )
 
-                if nonfinite_steps >= self.cfg.max_nonfinite_steps:
+                if nonfinite_steps >= self.cfg.logging.max_nonfinite_steps:
                     raise RuntimeError(
                         f"Encountered {nonfinite_steps} non-finite loss steps. "
                         "Aborting training for safety."
@@ -172,7 +172,7 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.trainable_params,
-                    max_norm=self.cfg.grad_clip,
+                    max_norm=self.cfg.train.grad_clip,
                 )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -180,13 +180,13 @@ class Trainer:
                 total_loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.trainable_params,
-                    max_norm=self.cfg.grad_clip,
+                    max_norm=self.cfg.train.grad_clip,
                 )
                 self.optimizer.step()
 
             self.scheduler.step()
 
-            if step % self.cfg.log_interval == 0:
+            if step % self.cfg.logging.log_interval == 0:
                 current_lr = float(self.scheduler.get_last_lr()[0])
 
                 grad_norm_value = (
@@ -274,7 +274,7 @@ class Trainer:
         )
 
     def fit(self) -> None:
-        for epoch in range(self.start_epoch, self.cfg.epochs):
+        for epoch in range(self.start_epoch, self.cfg.train.epochs):
             train_metrics = self._train_epoch(epoch)
 
             payload: Dict[str, Any] = {
@@ -287,7 +287,7 @@ class Trainer:
 
             if (
                 self.val_loader is not None
-                and (epoch + 1) % self.cfg.eval_interval == 0
+                and (epoch + 1) % self.cfg.logging.eval_interval == 0
             ):
                 val_metrics = self._validate(self.val_loader, self.val_metrics)
                 indicator = float(val_metrics.get("balanced_accuracy", 0.0))
@@ -309,7 +309,7 @@ class Trainer:
                     "best.pt", epoch=epoch, best_metric=self.best_metric
                 )
 
-            if (epoch + 1) % self.cfg.save_interval == 0:
+            if (epoch + 1) % self.cfg.logging.save_interval == 0:
                 self._save_checkpoint(
                     "last.pt", epoch=epoch, best_metric=self.best_metric
                 )
@@ -330,7 +330,7 @@ class Trainer:
 
         # Final last checkpoint.
         self._save_checkpoint(
-            "final.pt", epoch=self.cfg.epochs - 1, best_metric=self.best_metric
+            "final.pt", epoch=self.cfg.train.epochs - 1, best_metric=self.best_metric
         )
 
     def evaluate_best_on_test(self) -> Dict[str, float]:

@@ -2,7 +2,7 @@ import os
 import torch
 
 from transformers import ViTConfig
-
+from geospec_train import CoreConfig
 from .bridge import FineGrainedPromptTuning, FusionModule
 from .side_vit import ViTForImageClassification as SideViT
 from .frozen_vit import ViTForImageClassification as FrozenViT
@@ -35,7 +35,7 @@ def select_out_features(num_classes, criterion):
         out_features = 1
     return out_features
 
-def generate_model(cfg):
+def generate_model(cfg: CoreConfig):
     model = build_model(cfg)
     model = model.to(cfg.base.device)
 
@@ -75,7 +75,7 @@ def load_weights(model, checkpoint):
 
 
 
-def build_model(cfg):
+def build_model(cfg: CoreConfig):
     out_features = select_out_features(cfg.dataset.num_classes, cfg.train.criterion)
     num_layers = len(parse_layers(cfg.network.layers_to_extract))
     vit_config = ViTConfig.from_pretrained(cfg.network.pretrained_path)
@@ -108,7 +108,7 @@ def build_model(cfg):
     return model
 
 
-def build_frozen_encoder(cfg):
+def build_frozen_encoder(cfg: CoreConfig):
     frozen_config = ViTConfig.from_pretrained(cfg.network.pretrained_path)
     frozen_config.token_imp = cfg.network.token_imp
     frozen_config.token_ratio = cfg.network.token_ratio

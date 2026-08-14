@@ -10,6 +10,7 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from geospec_train.config import CoreConfig
 
 regression_loss = ["mean_square_error", "mean_absolute_error", "smooth_L1"]
 
@@ -114,31 +115,9 @@ def exit_with_error(msg):
     sys.exit(1)
 
 
-def get_by_path(d, path):
-    return reduce(getitem, path, d)
-
-
-def get_all_keys(cfg):
-    keys = []
-    for key, value in cfg.items():
-        if isinstance(value, dict):
-            keys += [[key] + subkey for subkey in get_all_keys(value)]
-        else:
-            keys.append([key])
-    return keys
-
 
 def get_terminal_col():
     try:
         return os.get_terminal_size().columns
     except OSError:
         return 80
-
-
-def add_path_suffix(path):
-    suffix = 0
-    new_path = path
-    while os.path.exists(new_path):
-        suffix += 1
-        new_path = path + "_{}".format(suffix)
-    return new_path
