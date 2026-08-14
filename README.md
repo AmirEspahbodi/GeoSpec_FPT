@@ -9,3 +9,7 @@ python train.py \
 Get-Service -Name ssh-agent | Set-Service -StartupType Manual
 Start-Service ssh-agent
 ssh-add C:\Users\amir\.ssh\id_ed25519.github
+https://github.com/YubiaoYue/MedMamba/blob/main/MedMamba.py
+
+python -m pip install --upgrade pip setuptools wheel ninja packaging
+python -m pip install mamba-ssm --no-build-isolation
