@@ -4,7 +4,7 @@ from geospec_train.config import CoreConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modules.medmamba import medmamba_t
+from geospec_model.medmamba import medmamba_t
 
 
 class DropPath(nn.Module):
@@ -287,8 +287,7 @@ class UnifiedManifoldFusion(nn.Module):
 
         self.coarse_prior_logits = nn.Parameter(torch.zeros(self.L, 3))
 
-        # Critical fix:
-        # Coarsest HH suppression must be at level L - 1, not level 0.
+
         if self.L > 0:
             self.coarse_prior_logits.data[self.L - 1, 2] = -1.0
 
@@ -1926,19 +1925,9 @@ class GeoSpecClassifier(nn.Module):
 
         B, L = x.shape[0], self.fusion_module.L
 
-        # Critical Bug #1 fix:
-        # Branch-2 differentiation must not be gated by self.training.
-        # When use_causal_mask=True, Branch 2 must always receive a
-        # deterministic structural frequency attenuation, in both train
-        # and eval. Stochasticity is only a train-time regularizer layered
-        # on top of this deterministic structural mask.
         wavelet_mask = None
         if use_causal_mask:
             wavelet_mask = torch.ones((B, 3, L), device=x.device, dtype=torch.float32)
-            # Deterministic structural attenuation for the causal-frequency
-            # branch. LH and HL are attenuated; HH is left unchanged.
-            # This guarantees Branch 2 is mathematically distinct from
-            # Branch 1 during validation/test/inference.
             wavelet_mask[:, 0:2, :] = 0.5
             if self.training:
                 keep_prob = 0.5
@@ -2056,8 +2045,7 @@ class GeoSpecClassifier(nn.Module):
             result["log_probs"], nan=0.0, posinf=0.0, neginf=-1e8
         )
 
-        # Critical fix:
-        # logits must be raw scores, not log-probabilities.
+
         result["logits"] = torch.nan_to_num(
             deca_out["logits_raw"], nan=0.0, posinf=50.0, neginf=-50.0
         )
@@ -2082,7 +2070,6 @@ class GeoSpecClassifier(nn.Module):
                 for t in result["hyperbolic_cache"]
             )
 
-        # FIX FOR BUG #2: Prevent Autograd Graph Retention in Persistent State
         if not suppress_side_effects:
             self._last_aux_losses = {
                 k: (v.detach() if torch.is_tensor(v) else v)
@@ -2316,11 +2303,7 @@ class GeoSpecClassifier(nn.Module):
 
         finite_rows = torch.isfinite(cls_embeddings).all(dim=-1)
 
-        # ------------------------------------------------------------
-        # High-priority fix:
-        # Initialize prototypes from ground-truth samples.
-        # Then refine with correct samples when available.
-        # ------------------------------------------------------------
+
         for cls in range(self.num_classes):
             gt_mask = finite_rows & (labels == cls)
 
@@ -2398,13 +2381,6 @@ class GeoSpecClassifier(nn.Module):
                 raise TypeError(
                     "target_class must be an int, a 0D tensor, or a 1D batched tensor."
                 )
-
-            # Critical Bug #2 fix:
-            # Do not unconditionally force x to FP32. Under true FP16/BF16
-            # deployment, that causes a deterministic dtype mismatch in the
-            # first backbone convolution. Instead, run the forward pass in the
-            # model's native parameter dtype, then upcast the gradient to FP32
-            # for stable saliency post-processing.
             try:
                 model_dtype = next(self.cnn_backbone.parameters()).dtype
             except StopIteration:

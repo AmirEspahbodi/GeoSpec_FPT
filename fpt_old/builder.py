@@ -2,9 +2,9 @@ import os
 
 from torchvision import datasets
 from geospec_train.config import CoreConfig
-from old.data.transforms import data_transforms, simple_transform
-from old.data.dataset import PreloadImageFolder, AsymetricImageFolder
-from old.func import mean_and_std, print_dataset_info
+from fpt_old.data.transforms import data_transforms, simple_transform
+from fpt_old.data.dataset import PreloadImageFolder, AsymetricImageFolder
+from fpt_old.func import mean_and_std, print_dataset_info
 
 
 def generate_dataset(cfg: CoreConfig):

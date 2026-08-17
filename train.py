@@ -10,7 +10,7 @@ from geospec_train.config import CoreConfig
 from geospec_train.data import build_dataloaders
 from geospec_train.engine import Trainer
 from geospec_train.utils import ensure_dir, set_seed
-from geospec_model.modules.builder import build_model
+from geospec_model.fpt_modules.builder import build_model
 from geospec_model.geospec_fpt import GeoSpecClassifier
 
 

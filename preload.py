@@ -15,8 +15,8 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from geospec_train.config import CoreConfig
-from old.func import *
-from geospec_model.modules.builder import build_frozen_encoder
+from fpt_old.func import *
+from geospec_model.fpt_modules.builder import build_frozen_encoder
 
 
 original_check_help = argparse.ArgumentParser._check_help
