@@ -14,7 +14,4 @@ https://github.com/YubiaoYue/MedMamba/blob/main/MedMamba.py
 python -m pip install --upgrade pip setuptools wheel ninja packaging
 python -m pip install mamba-ssm --no-build-isolation
 
-$env:MAMBA_FORCE_BUILD="TRUE"
-$env:MAMBA_KEEP_CUDA_BUILD="TRUE"
-
-pip install mamba-ssm --no-build-isolation
+MAMBA_FORCE_BUILD=TRUE MAMBA_KEEP_CUDA_BUILD=TRUE pip install mamba-ssm --no-build-isolation
